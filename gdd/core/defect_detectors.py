@@ -20,6 +20,149 @@ class DefectDetectionContext:
 def _clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
+def _rotate_mask_to_upright(mask01: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Rotate the binary mask so the main axis of the glove is roughly vertical.
+    Returns (rotated_mask01, angle_degrees_applied).
+    """
+    pts = np.column_stack(np.where(mask01 > 0))  # (y,x)
+    if pts.shape[0] < 200:
+        return mask01, 0.0
+
+    pts_xy = pts[:, ::-1].astype(np.float32)  # (x,y)
+    mean = pts_xy.mean(axis=0, keepdims=True)
+    centered = pts_xy - mean
+    cov = (centered.T @ centered) / float(max(1, centered.shape[0] - 1))
+    vals, vecs = np.linalg.eigh(cov)
+    pc1 = vecs[:, int(np.argmax(vals))]  # (vx,vy)
+
+    angle = float(np.degrees(np.arctan2(pc1[1], pc1[0])))  # relative to +x
+    # We want the main axis to align with +y (90 degrees).
+    rot = 90.0 - angle
+
+    h, w = mask01.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), rot, 1.0)
+    out = cv2.warpAffine(mask01.astype(np.uint8), m, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+    return (out > 0).astype(np.uint8), float(rot)
+
+
+def _count_profile_peaks(mask01: np.ndarray) -> int:
+    """
+    Count finger-like peaks by projecting the top portion of the mask onto the x-axis.
+    This is tolerant to lighting changes since it uses only silhouette geometry.
+    """
+    if mask01.sum() < 300:
+        return 0
+
+    ys = np.where(mask01 > 0)[0]
+    if ys.size == 0:
+        return 0
+    y0, y1 = int(ys.min()), int(ys.max())
+    h = y1 - y0 + 1
+    top = mask01[y0 : y0 + int(round(0.50 * h)), :]
+    if top.sum() < 200:
+        return 0
+
+    prof = top.sum(axis=0).astype(np.float32)
+    if prof.max() <= 1:
+        return 0
+    prof /= (prof.max() + 1e-6)
+
+    win = 11
+    kernel = np.ones((win,), np.float32) / float(win)
+    prof_s = np.convolve(prof, kernel, mode="same")
+
+    thresh = max(0.25, float(np.percentile(prof_s, 75)))
+    min_sep = max(14, int(round(mask01.shape[1] * 0.05)))
+
+    peaks: list[int] = []
+    for i in range(2, len(prof_s) - 2):
+        if prof_s[i] < thresh:
+            continue
+        if prof_s[i] >= prof_s[i - 1] and prof_s[i] >= prof_s[i + 1] and prof_s[i] >= prof_s[i - 2] and prof_s[i] >= prof_s[i + 2]:
+            if not peaks or (i - peaks[-1]) > min_sep:
+                peaks.append(i)
+    return int(len(peaks))
+
+
+def _count_fingers_convexity(mask01: np.ndarray) -> int:
+    """
+    Count fingers using convexity defects on the glove silhouette.
+    Rough idea (as commonly suggested for hand/finger counting in OpenCV):
+      valleys between fingers -> convexity defects -> finger count ~ defects + 1
+    """
+    m = (mask01 > 0).astype(np.uint8)
+    if m.sum() < 400:
+        return 0
+
+    cnts, _ = cv2.findContours((m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return 0
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 400:
+        return 0
+
+    hull = cv2.convexHull(c, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return 0
+    defects = cv2.convexityDefects(c, hull)
+    if defects is None:
+        return 0
+
+    ys = c[:, 0, 1]
+    y_min = int(np.min(ys))
+    y_max = int(np.max(ys))
+    h = max(1, y_max - y_min + 1)
+    top_band_y = y_min + int(round(0.55 * h))
+
+    good_valleys = 0
+    for s, e, f, depth in defects.reshape(-1, 4):
+        start = c[int(s)][0]
+        end = c[int(e)][0]
+        far = c[int(f)][0]
+        depth_px = float(depth) / 256.0
+        if depth_px < 10.0:
+            continue
+        # Focus on the upper part where finger gaps exist.
+        if int(far[1]) > top_band_y:
+            continue
+
+        a = np.linalg.norm(end - start) + 1e-6
+        b = np.linalg.norm(far - start) + 1e-6
+        d = np.linalg.norm(end - far) + 1e-6
+        # Angle at the far point.
+        cosang = float((b * b + d * d - a * a) / (2.0 * b * d + 1e-6))
+        cosang = max(-1.0, min(1.0, cosang))
+        ang = float(np.degrees(np.arccos(cosang)))
+        if ang < 18.0 or ang > 95.0:
+            continue
+        good_valleys += 1
+
+    # Defects correspond to valleys between fingers; convert to count estimate.
+    if good_valleys <= 0:
+        return 0
+    return int(min(8, max(0, good_valleys + 1)))
+
+
+def _estimate_finger_count(glove_mask_filled: np.ndarray) -> tuple[int, dict]:
+    """
+    Estimate how many fingers are present using two silhouette-only methods:
+    - profile peak counting
+    - convexity-defects counting
+    """
+    mask = (glove_mask_filled > 0).astype(np.uint8)
+    rot_mask, rot = _rotate_mask_to_upright(mask)
+    p = _count_profile_peaks(rot_mask)
+    h = _count_fingers_convexity(rot_mask)
+
+    counts = [c for c in (p, h) if c > 0]
+    if not counts:
+        return 0, {"rot_deg": rot, "profile_peaks": p, "hull_count": h}
+    # Use a robust summary (median-ish).
+    counts.sort()
+    est = counts[len(counts) // 2]
+    return int(est), {"rot_deg": rot, "profile_peaks": p, "hull_count": h}
+
 
 def _bbox_from_stats(stats_row: np.ndarray) -> BoundingBox:
     x, y, w, h, _ = [int(v) for v in stats_row.tolist()]
@@ -39,6 +182,16 @@ def _detect_holes(glove_mask: np.ndarray, glove_mask_filled: np.ndarray) -> list
     holes = cv2.morphologyEx(holes, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
     out: list[Defect] = []
+    # Cuff/opening suppression: ignore a very large "hole" near the bottom band
+    # (often just the glove opening showing background).
+    ys = np.where(mf > 0)[0]
+    if ys.size:
+        y0, y1 = int(ys.min()), int(ys.max())
+        gh = max(1, y1 - y0 + 1)
+        cuff_y = y1 - int(round(0.18 * gh))
+    else:
+        cuff_y = int(mf.shape[0] * 0.85)
+
     for i in range(1, num):
         x, y, w, h, area = [int(v) for v in stats[i].tolist()]
         if area < 40:
@@ -46,6 +199,11 @@ def _detect_holes(glove_mask: np.ndarray, glove_mask_filled: np.ndarray) -> list
         bbox = BoundingBox(x=x, y=y, w=w, h=h)
         aspect = (max(w, h) / (min(w, h) + 1e-6))
         area_norm = float(area) / glove_area
+
+        cy = y + (h / 2.0)
+        if cy >= float(cuff_y) and area_norm > 0.02:
+            # Likely cuff opening rather than a puncture/hole defect.
+            continue
 
         comp = (labels == i).astype(np.uint8)
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -87,27 +245,33 @@ def _edge_fold_wrinkle(ctx: DefectDetectionContext) -> list[Defect]:
     """
     Use edge structure to detect fold damage vs wrinkles/dents.
     """
-    mask01 = (ctx.glove_mask > 0).astype(np.uint8)
+    mask01 = (ctx.glove_mask_filled > 0).astype(np.uint8)
+    # Work on interior (avoid boundary edges dominating the score).
+    boundary = cv2.dilate(mask01, np.ones((9, 9), np.uint8), iterations=1) - cv2.erode(mask01, np.ones((9, 9), np.uint8), iterations=1)
+    boundary = (boundary > 0).astype(np.uint8)
+    interior = (mask01 & (1 - cv2.dilate(boundary, np.ones((13, 13), np.uint8), iterations=1))).astype(np.uint8)
+
     edges = (ctx.anomaly.edges * 255).astype(np.uint8)
-    edges[mask01 == 0] = 0
+    edges[interior == 0] = 0
 
     # Global edge density (in a smoothed sense) indicates wrinkles/texture anomalies.
-    density = float(ctx.anomaly.edges[mask01 > 0].mean()) if mask01.sum() else 0.0
+    density = float(ctx.anomaly.edges[interior > 0].mean()) if interior.sum() else 0.0
     out: list[Defect] = []
-    if density < 0.08:
+    if density < 0.10:
         return out
 
     # Detect strong long lines for "damaged by fold"
     e = cv2.Canny(cv2.cvtColor(ctx.bgr, cv2.COLOR_BGR2GRAY), 60, 160)
-    e[mask01 == 0] = 0
-    lines = cv2.HoughLinesP(e, 1, np.pi / 180, threshold=80, minLineLength=60, maxLineGap=12)
+    e[interior == 0] = 0
+    lines = cv2.HoughLinesP(e, 1, np.pi / 180, threshold=70, minLineLength=70, maxLineGap=10)
     if lines is not None and len(lines) > 0:
         h, w = mask01.shape[:2]
         lengths = []
         for (x1, y1, x2, y2) in lines.reshape(-1, 4):
             lengths.append(float(np.hypot(x2 - x1, y2 - y1)))
         max_len = max(lengths) if lengths else 0.0
-        if max_len > 0.35 * max(h, w):
+        # Strong fold: a dominant long straight line across a big fraction of the glove.
+        if max_len > 0.42 * max(h, w):
             out.append(
                 Defect(
                     label="damaged_by_fold",
@@ -172,6 +336,11 @@ def _spot_stain_discoloration(ctx: DefectDetectionContext) -> list[Defect]:
 
         mean_L = float(lab[:, :, 0][blob > 0].mean()) if blob.sum() else float(med[0])
         delta_L = (mean_L - float(med[0])) / 255.0
+        # Chroma anomaly (ignore brightness; more robust to shadows).
+        ab = lab[:, :, 1:3]
+        med_ab = med[1:3].reshape(1, 1, 2)
+        de_ab = np.linalg.norm(ab - med_ab, axis=2)
+        mean_de_ab = float(de_ab[blob > 0].mean()) if blob.sum() else 0.0
 
         # Heuristic label based on size and brightness change.
         if area <= 180 and max(w, h) <= 30:
@@ -186,7 +355,9 @@ def _spot_stain_discoloration(ctx: DefectDetectionContext) -> list[Defect]:
             if delta_L < -0.06:
                 out.append(Defect(label="stain_dirty", score=_clamp01(0.50 + 0.5 * mean_de), bbox=bbox))
             else:
-                out.append(Defect(label="discoloration", score=_clamp01(0.50 + 0.5 * mean_de), bbox=bbox))
+                # Prefer discoloration when chroma differs (not just bright/dim).
+                chroma_boost = min(0.25, mean_de_ab / 45.0)
+                out.append(Defect(label="discoloration", score=_clamp01(0.55 + 0.45 * mean_de + chroma_boost), bbox=bbox))
         else:
             # Medium blobs are usually stains/dirty spots.
             out.append(Defect(label="stain_dirty", score=_clamp01(0.50 + 0.5 * mean_de), bbox=bbox))
@@ -273,52 +444,28 @@ def _roll_and_beading(ctx: DefectDetectionContext) -> list[Defect]:
     return out
 
 
-def _missing_finger(ctx: DefectDetectionContext) -> list[Defect]:
+def _finger_count_anomaly(ctx: DefectDetectionContext) -> list[Defect]:
     """
-    Approximate missing-finger detection using a simple silhouette profile peak count.
-
-    Works best when:
-    - the glove is roughly upright in frame
-    - fingers are separated or at least distinguishable in the silhouette
+    Detect missing/extra fingers using silhouette-only structural features.
+    We estimate a finger count from the glove mask, and flag anomalies vs 5.
     """
-    mask = (ctx.glove_mask_filled > 0).astype(np.uint8)
-    if mask.sum() < 300:
+    count, meta = _estimate_finger_count(ctx.glove_mask_filled)
+    if count <= 0:
         return []
 
-    ys = np.where(mask > 0)[0]
-    y0, y1 = int(ys.min()), int(ys.max())
-    h = y1 - y0 + 1
-    top = mask[y0 : y0 + int(round(0.45 * h)), :]
-    if top.sum() < 200:
-        return []
+    expected = 5
+    diff = int(count) - expected
+    out: list[Defect] = []
+    meta = dict(meta)
+    meta.update({"finger_count": int(count), "expected": expected})
 
-    # Column-wise profile in top region.
-    prof = top.sum(axis=0).astype(np.float32)
-    if prof.max() <= 1:
-        return []
-    prof /= (prof.max() + 1e-6)
-
-    # Smooth with a small window.
-    win = 9
-    kernel = np.ones((win,), np.float32) / float(win)
-    prof_s = np.convolve(prof, kernel, mode="same")
-
-    # Peak count above a threshold with non-max suppression.
-    thresh = 0.32
-    peaks: list[int] = []
-    for i in range(2, len(prof_s) - 2):
-        if prof_s[i] < thresh:
-            continue
-        if prof_s[i] >= prof_s[i - 1] and prof_s[i] >= prof_s[i + 1] and prof_s[i] >= prof_s[i - 2] and prof_s[i] >= prof_s[i + 2]:
-            if not peaks or (i - peaks[-1]) > 18:
-                peaks.append(i)
-
-    # Typical hand gloves have 5 fingers; allow 4–6 peaks due to thumb merging etc.
-    if len(peaks) <= 3:
-        return [Defect(label="missing_finger", score=_clamp01(0.78), bbox=None, meta={"peaks": len(peaks)})]
-    if len(peaks) == 4:
-        return [Defect(label="missing_finger", score=_clamp01(0.55), bbox=None, meta={"peaks": len(peaks)})]
-    return []
+    if diff < 0:
+        score = 0.55 + 0.18 * min(3, abs(diff))
+        out.append(Defect(label="missing_finger", score=_clamp01(score), bbox=None, meta=meta))
+    elif diff > 0:
+        score = 0.55 + 0.16 * min(3, abs(diff))
+        out.append(Defect(label="extra_fingers", score=_clamp01(score), bbox=None, meta=meta))
+    return out
 
 
 def _inside_out(ctx: DefectDetectionContext) -> list[Defect]:
@@ -388,7 +535,7 @@ def detect_defects(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: n
     defects.extend(_spot_stain_discoloration(ctx))
     defects.extend(_edge_fold_wrinkle(ctx))
     defects.extend(_roll_and_beading(ctx))
-    defects.extend(_missing_finger(ctx))
+    defects.extend(_finger_count_anomaly(ctx))
     defects.extend(_inside_out(ctx))
 
     # De-duplicate by label (keep max score) but keep bboxes for localized defects.

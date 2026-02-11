@@ -38,7 +38,16 @@ def main() -> None:
         min_surface_score = st.slider("Min score (surface)", min_value=0.0, max_value=1.0, value=0.85, step=0.01)
         max_boxes = st.slider("Max boxes to draw", min_value=1, max_value=100, value=30, step=1)
 
-    structural_labels = {"hole", "tear", "missing_finger", "inside_out", "improper_roll", "incomplete_beading", "damaged_by_fold"}
+    structural_labels = {
+        "hole",
+        "tear",
+        "missing_finger",
+        "extra_fingers",
+        "inside_out",
+        "improper_roll",
+        "incomplete_beading",
+        "damaged_by_fold",
+    }
 
     def passes_threshold(label: str, score: float) -> bool:
         if label in structural_labels:

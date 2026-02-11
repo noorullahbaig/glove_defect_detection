@@ -16,4 +16,5 @@ DEFECT_LABELS = [
     "improper_roll",
     "incomplete_beading",
     "missing_finger",
+    "extra_fingers",
 ]

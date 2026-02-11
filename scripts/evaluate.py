@@ -55,7 +55,16 @@ def main() -> None:
     label_stats = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
 
     rows_out = []
-    structural_labels = {"hole", "tear", "missing_finger", "inside_out", "improper_roll", "incomplete_beading", "damaged_by_fold"}
+    structural_labels = {
+        "hole",
+        "tear",
+        "missing_finger",
+        "extra_fingers",
+        "inside_out",
+        "improper_roll",
+        "incomplete_beading",
+        "damaged_by_fold",
+    }
 
     def passes_threshold(label: str, score: float) -> bool:
         if label in structural_labels:
