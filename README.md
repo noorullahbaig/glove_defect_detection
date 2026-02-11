@@ -61,7 +61,7 @@ In the GUI you can upload any of the downloaded images from `data/public/trial_g
 Your main labels file is `data/labels.csv` with (at minimum) these columns:
 
 - `file`: relative path to image (from repo root)
-- `glove_type`: one of `nitrile`, `latex`, `fabric`
+- `glove_type`: one of `nitrile`, `plastic`, `fabric`
 - `defect_labels`: pipe-separated labels (multi-label), e.g. `spotting|stain_dirty`
 - `split`: `train`, `val`, or `test`
 - `lighting`: free text (e.g. `daylight`, `warm_indoor`, `dim_indoor`)

@@ -148,7 +148,11 @@ DEFECT_DRAWERS = {
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in-dir", default="data/public/commons", help="Input commons folder from scripts/collect_commons.py")
+    ap.add_argument(
+        "--in-dir",
+        default="data/public/public_clean",
+        help="Input dataset folder (supports both raw collectors and cleaned datasets)",
+    )
     ap.add_argument("--out-dir", default="data/public/synth", help="Output folder for synthetic defects")
     ap.add_argument("--per-image", type=int, default=2, help="How many synthetic variants per source image")
     ap.add_argument("--max-per-type", type=int, default=80, help="Max source images per glove type")
@@ -165,14 +169,18 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    for glove_type in ("nitrile", "latex", "fabric"):
+    for glove_type in ("nitrile", "plastic", "fabric"):
+        # Support both:
+        # - raw collectors: <in_dir>/<type>/images/*.jpg
+        # - cleaned datasets: <in_dir>/images/<type>/*.png
         src_dir = in_dir / glove_type / "images"
+        if not src_dir.exists():
+            src_dir = in_dir / "images" / glove_type
         if not src_dir.exists():
             print(f"Skipping missing: {src_dir}")
             continue
-        src_paths = sorted([p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg', '.png'}])[
-            : int(args.max_per_type)
-        ]
+
+        src_paths = sorted([p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg', '.png'}])[: int(args.max_per_type)]
 
         for src in src_paths:
             img = read_image(src).bgr
@@ -215,4 +223,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

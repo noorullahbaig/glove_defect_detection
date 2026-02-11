@@ -24,6 +24,8 @@ def _f1(p: float, r: float) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", default="data/labels.csv", help="Path to labels CSV")
+    ap.add_argument("--min-struct-score", type=float, default=0.65, help="Min score for structural defects")
+    ap.add_argument("--min-surface-score", type=float, default=0.85, help="Min score for surface/color defects")
     args = ap.parse_args()
 
     df = load_labels_csv(args.labels)
@@ -53,6 +55,13 @@ def main() -> None:
     label_stats = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
 
     rows_out = []
+    structural_labels = {"hole", "tear", "missing_finger", "inside_out", "improper_roll", "incomplete_beading", "damaged_by_fold"}
+
+    def passes_threshold(label: str, score: float) -> bool:
+        if label in structural_labels:
+            return score >= float(args.min_struct_score)
+        return score >= float(args.min_surface_score)
+
     for _, row in test_df.iterrows():
         path = str(row["file"])
         true_gt = str(row["glove_type"])
@@ -63,7 +72,7 @@ def main() -> None:
         res = pipeline.infer(img)
 
         pred_gt = res.glove_type
-        pred_def = {d.label for d in res.defects if d.score >= 0.55}
+        pred_def = {d.label for d in res.defects if passes_threshold(str(d.label), float(d.score))}
         # If the pipeline has no trained glove-type model loaded, it returns "unknown".
         # In that case, fall back to an explicit "unknown" class in eval instead of
         # skewing the confusion matrix with missing labels.

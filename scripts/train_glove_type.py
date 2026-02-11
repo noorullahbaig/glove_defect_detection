@@ -25,6 +25,9 @@ def main() -> None:
     ap.add_argument("--out", default="gdd/models/glove_type.joblib", help="Output model path")
     ap.add_argument("--max-side", type=int, default=450, help="Resize max side before feature extraction (speed/robustness tradeoff)")
     ap.add_argument("--limit", type=int, default=0, help="If >0, cap number of train/val rows (for quick experiments)")
+    ap.add_argument("--model", default="logreg", choices=["logreg", "rf"], help="Classifier type")
+    ap.add_argument("--balance", action="store_true", help="Downsample classes to the same size (reduces bias on imbalanced public data)")
+    ap.add_argument("--max-per-class", type=int, default=0, help="If >0, cap each glove_type to at most N train/val rows")
     args = ap.parse_args()
 
     df = load_labels_csv(args.labels)
@@ -36,6 +39,25 @@ def main() -> None:
     df = df[df["split"].astype(str).isin(["train", "val"])].copy()
     if df.empty:
         raise SystemExit("No train/val rows in labels.csv")
+
+    if int(args.max_per_class) > 0:
+        cap = int(args.max_per_class)
+        df = (
+            df.groupby("glove_type", group_keys=False)
+            .apply(lambda g: g.sample(n=min(len(g), cap), random_state=42))
+            .reset_index(drop=True)
+        )
+
+    if bool(args.balance):
+        # Downsample to the smallest class to reduce imbalance (useful for public-only datasets).
+        sizes = df.groupby("glove_type").size().to_dict()
+        min_n = int(min(sizes.values())) if sizes else 0
+        if min_n >= 2:
+            df = (
+                df.groupby("glove_type", group_keys=False)
+                .apply(lambda g: g.sample(n=min_n, random_state=42))
+                .reset_index(drop=True)
+            )
 
     if int(args.limit) > 0 and len(df) > int(args.limit):
         df = df.sample(n=int(args.limit), random_state=42).reset_index(drop=True)
@@ -54,7 +76,7 @@ def main() -> None:
         y_list.append(gt)
 
     x = np.stack(x_list, axis=0)
-    model = train_glove_type_model(x, y_list)
+    model = train_glove_type_model(x, y_list, model_type=str(args.model))
     out_path = Path(args.out)
     save_glove_type_model(model, out_path)
     print(f"Saved glove type model to {out_path}")

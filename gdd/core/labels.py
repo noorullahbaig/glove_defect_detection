@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-GLOVE_TYPES = ["nitrile", "latex", "fabric"]
+# Option C glove types: nitrile + cafeteria plastic (PE/vinyl) + work/leather glove.
+GLOVE_TYPES = ["nitrile", "plastic", "fabric"]
 
 DEFECT_LABELS = [
     "discoloration",
@@ -16,4 +17,3 @@ DEFECT_LABELS = [
     "incomplete_beading",
     "missing_finger",
 ]
-

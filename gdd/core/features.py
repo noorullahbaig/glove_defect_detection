@@ -47,7 +47,7 @@ def shape_features(mask01_filled: np.ndarray) -> np.ndarray:
 
 def glove_type_features(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np.ndarray) -> np.ndarray:
     """
-    Feature vector for glove type classification (nitrile/latex/fabric).
+    Feature vector for glove type classification (nitrile/plastic/fabric).
     """
     mask01 = (glove_mask > 0).astype(np.uint8)
     mask01f = (glove_mask_filled > 0).astype(np.uint8)

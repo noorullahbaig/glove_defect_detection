@@ -130,7 +130,7 @@ def _fetch_item(title: str, thumb_width: int) -> CommonsItem | None:
             "action": "query",
             "prop": "imageinfo",
             "titles": title,
-            "iiprop": "url|size|extmetadata",
+            "iiprop": "url|size|extmetadata|mime",
             "iiurlwidth": thumb_width,
         }
     )
@@ -142,6 +142,14 @@ def _fetch_item(title: str, thumb_width: int) -> CommonsItem | None:
     if not imageinfo:
         return None
     info = imageinfo[0]
+    mime = str(info.get("mime") or "")
+    # Skip non-image media like PDFs/DjVu (thumbs exist but aren't glove photos).
+    if mime and not mime.startswith("image/"):
+        return None
+    # Also skip obvious document titles.
+    lower = title.lower()
+    if lower.endswith(".pdf") or lower.endswith(".djvu") or lower.endswith(".svg"):
+        return None
     meta = info.get("extmetadata") or {}
 
     license_short = _extmeta_val(meta, "LicenseShortName")
@@ -185,6 +193,36 @@ def _safe_name(title: str) -> str:
     return name
 
 
+def _title_ok_for_type(glove_type: str, title: str) -> bool:
+    """
+    Commons search/categories can mix glove materials. Apply a strict heuristic filter
+    based on the file title to reduce cross-contamination between classes.
+    """
+    t = title.lower()
+
+    # Common cross-type words:
+    exclude_all = ["condom", "mitt", "mitten"]
+    if any(x in t for x in exclude_all):
+        return False
+
+    if glove_type == "nitrile":
+        include = ["nitrile"]
+        exclude = ["latex", "vinyl", "polyethylene", "plastic", "pe glove", "pe-glove"]
+        return any(x in t for x in include) and not any(x in t for x in exclude)
+
+    if glove_type == "plastic":
+        include = ["plastic glove", "polyethylene", "pe glove", "pe-glove", "vinyl glove", "vinyl"]
+        exclude = ["nitrile", "latex"]
+        return any(x in t for x in include) and not any(x in t for x in exclude)
+
+    if glove_type == "fabric":
+        include = ["work glove", "work gloves", "garden glove", "gardening glove", "leather glove", "protective glove", "glove"]
+        exclude = ["nitrile", "latex", "vinyl glove", "polyethylene", "disposable glove", "disposable gloves"]
+        return any(x in t for x in include) and not any(x in t for x in exclude)
+
+    return True
+
+
 def _download(url: str, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     backoff = 1.5
@@ -207,32 +245,48 @@ def _download(url: str, out_path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default="data/public/commons", help="Output folder")
+    ap.add_argument("--out-dir", default="data/public/commons_raw", help="Output folder")
     ap.add_argument("--thumb-width", type=int, default=1024, help="Download thumb width (reduces file sizes)")
     ap.add_argument("--per-type", type=int, default=60, help="Max items per glove type")
+    ap.add_argument("--types", nargs="*", default=None, help="Subset of glove types to collect (default: all)")
     ap.add_argument("--use-categories", action="store_true", help="Also pull from relevant Commons categories")
     ap.add_argument("--sleep", type=float, default=0.35, help="Sleep seconds between downloads (reduces rate limiting)")
+    ap.add_argument("--min-dim", type=int, default=500, help="Minimum thumbnail width/height to keep")
+    ap.add_argument("--strict-title-filter", action="store_true", help="Apply strict title-based filtering per glove type")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Broader queries increase recall on Commons.
-    queries = {
-        "nitrile": '("nitrile glove" OR "nitrile disposable glove")',
-        "latex": '("latex glove" OR "latex disposable glove")',
-        "fabric": '("work glove" OR "garden glove" OR "gardening glove" OR "protective glove" OR "leather glove")',
+    # Commons search syntax support can vary; use simple queries (multiple per type).
+    queries: dict[str, list[str]] = {
+        "nitrile": ["nitrile glove", "disposable nitrile glove", "blue nitrile glove"],
+        "plastic": ["plastic glove", "vinyl glove", "polyethylene glove", "PE glove"],
+        "fabric": ["work glove", "work gloves", "garden glove", "gardening glove", "leather glove"],
     }
 
     categories = {
-        "nitrile": ["Nitrile gloves", "Disposable gloves"],
-        "latex": ["Latex gloves", "Disposable gloves"],
-        "fabric": ["Work gloves", "Gardening gloves", "Protective gloves"],
+        # Keep categories narrow to avoid cross-contamination between glove types.
+        # Broad categories like "Disposable gloves" tend to mix nitrile/latex/vinyl/PE together.
+        "nitrile": [],
+        "plastic": ["Plastic gloves", "Disposable cooking gloves"],
+        "fabric": ["Work gloves", "Garden gloves", "Leather gloves"],
     }
 
+    glove_types = list(queries.keys())
+    if args.types:
+        wanted = [str(x) for x in args.types]
+        bad = [x for x in wanted if x not in glove_types]
+        if bad:
+            raise SystemExit(f"Unknown glove types: {bad}. Valid: {glove_types}")
+        glove_types = wanted
+
     manifest_rows: list[dict] = []
-    for glove_type, q in queries.items():
-        titles = _search_file_titles(q, limit=int(args.per_type) * 4)
+    for glove_type in glove_types:
+        q_list = queries[glove_type]
+        titles: list[str] = []
+        for q in q_list:
+            titles.extend(_search_file_titles(q, limit=int(args.per_type) * 4))
         if args.use_categories:
             for cat in categories.get(glove_type, []):
                 titles.extend(_category_file_titles(cat, limit=int(args.per_type) * 3))
@@ -247,11 +301,13 @@ def main() -> None:
             titles = deduped
         items: list[CommonsItem] = []
         for t in titles:
+            if args.strict_title_filter and not _title_ok_for_type(glove_type, t):
+                continue
             it = _fetch_item(t, thumb_width=int(args.thumb_width))
             if it is None:
                 continue
             # crude quality filter
-            if it.thumb_width < 500 or it.thumb_height < 500:
+            if it.thumb_width < int(args.min_dim) or it.thumb_height < int(args.min_dim):
                 continue
             items.append(it)
             if len(items) >= int(args.per_type):

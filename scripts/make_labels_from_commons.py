@@ -9,7 +9,7 @@ import pandas as pd
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", default="data/public/commons/manifest.csv", help="Commons manifest.csv path")
+    ap.add_argument("--manifest", default="data/public/commons_clean/manifest.csv", help="Commons manifest.csv path")
     ap.add_argument("--out", default="data/commons_labels.csv", help="Output labels CSV")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--train-frac", type=float, default=0.70)
@@ -66,4 +66,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
