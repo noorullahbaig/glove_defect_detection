@@ -24,7 +24,8 @@ def shape_features(mask01_filled: np.ndarray) -> np.ndarray:
     """
     cnts, _ = cv2.findContours(mask01_filled.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
-        return np.zeros((12,), dtype=np.float32)
+        # 6 scalar features + 7 Hu moments = 13 dims (must be stable length)
+        return np.zeros((13,), dtype=np.float32)
     c = max(cnts, key=cv2.contourArea)
     area = float(cv2.contourArea(c))
     x, y, w, h = cv2.boundingRect(c)
@@ -55,4 +56,3 @@ def glove_type_features(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_fill
     th = lbp_hist(gray, mask01, bins=256)
     sh = shape_features(mask01f)
     return np.concatenate([ch, th, sh], axis=0).astype(np.float32)
-

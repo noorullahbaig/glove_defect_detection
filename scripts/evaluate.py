@@ -35,6 +35,15 @@ def main() -> None:
     if test_df.empty:
         raise SystemExit("No test rows in labels.csv (set split=test for some rows).")
 
+    # Auto-detect whether defect labels exist in this labels file.
+    # If all defect labels are empty, we skip defect metrics (otherwise everything becomes FP).
+    has_any_defects = False
+    if "defect_labels" in df.columns:
+        for v in df["defect_labels"].astype(str).fillna("").tolist():
+            if parse_defect_labels(v):
+                has_any_defects = True
+                break
+
     pipeline = GDDPipeline.load_default()
 
     y_true_gt: list[str] = []
@@ -64,13 +73,14 @@ def main() -> None:
         y_true_gt.append(true_gt)
         y_pred_gt.append(pred_gt)
 
-        for lab in sorted(true_def | pred_def):
-            if lab in true_def and lab in pred_def:
-                label_stats[lab]["tp"] += 1
-            elif lab in pred_def and lab not in true_def:
-                label_stats[lab]["fp"] += 1
-            elif lab in true_def and lab not in pred_def:
-                label_stats[lab]["fn"] += 1
+        if has_any_defects:
+            for lab in sorted(true_def | pred_def):
+                if lab in true_def and lab in pred_def:
+                    label_stats[lab]["tp"] += 1
+                elif lab in pred_def and lab not in true_def:
+                    label_stats[lab]["fp"] += 1
+                elif lab in true_def and lab not in pred_def:
+                    label_stats[lab]["fn"] += 1
 
         rows_out.append(
             {
@@ -96,20 +106,23 @@ def main() -> None:
     fig_path = out_dir / "glove_type_confusion_matrix.png"
     fig.savefig(fig_path, dpi=180)
 
-    # Defect metrics summary.
-    metrics_rows = []
-    for lab, s in sorted(label_stats.items()):
-        tp, fp, fn = s["tp"], s["fp"], s["fn"]
-        p = tp / (tp + fp + 1e-9)
-        r = tp / (tp + fn + 1e-9)
-        metrics_rows.append({"label": lab, "precision": p, "recall": r, "f1": _f1(p, r), "tp": tp, "fp": fp, "fn": fn})
-    mdf = pd.DataFrame(metrics_rows).sort_values(["f1", "label"], ascending=[False, True])
-    m_path = out_dir / "defect_metrics.csv"
-    mdf.to_csv(m_path, index=False)
+    if has_any_defects:
+        # Defect metrics summary.
+        metrics_rows = []
+        for lab, s in sorted(label_stats.items()):
+            tp, fp, fn = s["tp"], s["fp"], s["fn"]
+            p = tp / (tp + fp + 1e-9)
+            r = tp / (tp + fn + 1e-9)
+            metrics_rows.append({"label": lab, "precision": p, "recall": r, "f1": _f1(p, r), "tp": tp, "fp": fp, "fn": fn})
+        mdf = pd.DataFrame(metrics_rows).sort_values(["f1", "label"], ascending=[False, True])
+        m_path = out_dir / "defect_metrics.csv"
+        mdf.to_csv(m_path, index=False)
+        print(f"Wrote: {m_path}")
+    else:
+        print("Skipped defect metrics (no defect_labels present in labels file).")
 
     print(f"Wrote: {out_csv}")
     print(f"Wrote: {fig_path}")
-    print(f"Wrote: {m_path}")
 
 
 if __name__ == "__main__":
