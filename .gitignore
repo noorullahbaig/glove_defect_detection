@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+.venv_gdd/
+venv/
+env/
+
+# Data + artifacts (keep structure, not contents)
+data/raw/
+data/public/
+data/processed/
+data/tmp/
+results/
+gdd/models/
+
+# Streamlit
+.streamlit/secrets.toml
