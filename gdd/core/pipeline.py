@@ -26,10 +26,21 @@ class GDDPipeline:
             model = load_glove_type_model(DEFAULT_GLOVE_TYPE_MODEL_PATH)
         return cls(glove_type_model=model)
 
-    def infer(self, bgr: np.ndarray) -> InferenceResult:
+    def infer(
+        self,
+        bgr: np.ndarray,
+        focus_only: bool = False,
+        allowed_labels: set[str] | None = None,
+    ) -> InferenceResult:
         bgr_p = preprocess(bgr)
         seg = segment_glove(bgr_p)
-        defects, _anom = detect_defects(bgr_p, seg.glove_mask, seg.glove_mask_filled)
+        defects, _anom = detect_defects(
+            bgr_p,
+            seg.glove_mask,
+            seg.glove_mask_filled,
+            focus_only=bool(focus_only),
+            allowed_labels=allowed_labels,
+        )
 
         glove_type = "unknown"
         glove_type_score = 0.0
@@ -43,4 +54,3 @@ class GDDPipeline:
             glove_type_score=float(glove_type_score),
             defects=defects,
         )
-

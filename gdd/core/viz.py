@@ -18,20 +18,26 @@ def overlay_mask(bgr: np.ndarray, mask: np.ndarray, color_bgr: tuple[int, int, i
 
 def draw_defects(bgr: np.ndarray, defects: list[Defect]) -> np.ndarray:
     out = bgr.copy()
+    color_map = {
+        "missing_finger": (0, 255, 255),  # yellow
+        "extra_fingers": (255, 255, 0),  # cyan
+        "hole": (0, 80, 255),  # orange-ish
+        "damaged_by_fold": (255, 0, 255),
+    }
     for d in defects:
         if d.bbox is None:
             continue
         x1, y1, x2, y2 = d.bbox.as_xyxy()
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        color = color_map.get(str(d.label), (0, 0, 255))
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
             out,
             f"{d.label} ({d.score:.2f})",
             (x1, max(18, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (0, 0, 255),
+            color,
             2,
             cv2.LINE_AA,
         )
     return out
-

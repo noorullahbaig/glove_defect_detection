@@ -34,11 +34,18 @@
 - Train/val/test split method
 - Metrics: glove type confusion matrix; defect precision/recall/F1
 - Robustness matrix results (lighting/background/distance/orientation)
+- Add a curated sanity-check subsection (for example `data/my_test`) with:
+  - expected defect from filename
+  - predicted defect + score
+  - pass/fail note
 
 ## 4. Discussion
 - What works well and why
 - Failure cases (with figures)
 - Limitations and mitigation attempts
+- Include practical deployment notes:
+  - Streamlit startup method used in testing
+  - connection-refused troubleshooting steps followed
 
 ## 5. Critical comments and future work
 - More data, better segmentation, feature learning (without TF), etc.
@@ -46,4 +53,3 @@
 ## 6. Conclusion
 
 ## References (APA; scholarly sources only)
-

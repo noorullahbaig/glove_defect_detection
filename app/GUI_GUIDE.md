@@ -3,11 +3,23 @@
 ## Start the app
 
 ```bash
-source .venv_gdd/bin/activate
-streamlit run app/streamlit_app.py
+cd "/Users/ayaanminhas/Desktop/IPPR Assignment"
+.venv_gdd/bin/streamlit run app/streamlit_app.py --server.headless true --server.address 0.0.0.0 --server.port 8501
 ```
 
-If you used a different virtualenv, activate it instead.
+Keep this terminal window open while you are using the app.
+
+Expected output includes:
+- Local URL: `http://localhost:8501`
+- Network URL: `http://<your-ip>:8501`
+
+If you get Streamlit connection error / refused connection:
+
+```bash
+lsof -nP -iTCP:8501 -sTCP:LISTEN
+```
+
+If no process is listening, restart with the exact command above.
 
 ## Single Image tab
 
@@ -23,16 +35,36 @@ Outputs shown:
 - Right: segmentation overlay + defect boxes
 - Below: predicted glove type + list of defects and scores
 
+Default score filters:
+- Structural labels: min score `0.65`
+- Surface/color labels: min score `0.85`
+
+Focus mode (default labels):
+- `missing_finger`
+- `extra_fingers`
+- `hole`
+- `discoloration`
+- `damaged_by_fold`
+
 ## Batch Folder tab
 
 1) Set `Folder path (local)` to something like:
    - `data/raw` (your captured images)
    - `data/public/trial_glove_defect/images` (trial dataset)
+   - `data/my_test` (curated defect sanity checks)
 2) Click **Run batch**
 
 Files written:
 - `results/overlays/*_overlay.png` (visual outputs)
 - `results/batch_results.csv` (predictions per file)
+
+## Curated test set (quick verification)
+
+Use `data/my_test` to verify focus-mode behavior quickly:
+- `missing_finger_4_fingers_and_one_cut_finger.png` -> expected `missing_finger`
+- `hole_on_fingertip.png` -> expected `hole`
+- `hole_in_the_middle.png` -> expected `hole`
+- stain/discoloration files -> expected `discoloration`
 
 ## Common “why is glove type unknown?”
 
@@ -42,6 +74,5 @@ The pipeline loads the glove-type classifier from:
 Train it after you have a real dataset in `data/labels.csv`:
 
 ```bash
-python scripts/train_glove_type.py --labels data/labels.csv --out gdd/models/glove_type.joblib
+.venv_gdd/bin/python scripts/train_glove_type.py --labels data/labels.csv --out gdd/models/glove_type.joblib
 ```
-

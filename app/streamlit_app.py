@@ -31,12 +31,38 @@ def main() -> None:
     st.caption("Classical CV pipeline (no Haar cascade, no TensorFlow, no template matching).")
 
     pipeline = GDDPipeline.load_default()
+    focus_labels = ["missing_finger", "extra_fingers", "hole", "discoloration", "damaged_by_fold"]
 
     with st.sidebar:
         st.subheader("Display filters")
         min_struct_score = st.slider("Min score (structural)", min_value=0.0, max_value=1.0, value=0.65, step=0.01)
         min_surface_score = st.slider("Min score (surface)", min_value=0.0, max_value=1.0, value=0.85, step=0.01)
         max_boxes = st.slider("Max boxes to draw", min_value=1, max_value=100, value=30, step=1)
+        st.subheader("Defect Scope")
+        focus_only = st.checkbox("Focus mode (target defects only)", value=True)
+        if focus_only:
+            selected_labels = focus_labels
+            st.caption("Focus labels: missing/extra fingers, hole, discoloration, damaged_by_fold")
+        else:
+            selected_labels = st.multiselect(
+                "Show only selected labels",
+                options=[
+                    "missing_finger",
+                    "extra_fingers",
+                    "hole",
+                    "discoloration",
+                    "damaged_by_fold",
+                    "tear",
+                    "stain_dirty",
+                    "spotting",
+                    "plastic_contamination",
+                    "wrinkles_dent",
+                    "inside_out",
+                    "improper_roll",
+                    "incomplete_beading",
+                ],
+                default=focus_labels,
+            )
 
     structural_labels = {
         "hole",
@@ -63,12 +89,16 @@ def main() -> None:
         else:
             bgr = _to_bgr(uploaded)
             bgr = resize_max_side(bgr, max_side=1200)
-            res = pipeline.infer(bgr)
+            res = pipeline.infer(
+                bgr,
+                focus_only=bool(focus_only),
+                allowed_labels=set(selected_labels) if selected_labels else None,
+            )
 
             col1, col2 = st.columns(2)
             with col1:
                 st.subheader("Input")
-                st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
             with col2:
                 st.subheader("Overlay")
                 over = overlay_mask(bgr, res.glove_mask)
@@ -76,7 +106,7 @@ def main() -> None:
                 draw_list.sort(key=lambda d: float(d.score), reverse=True)
                 draw_list = draw_list[: int(max_boxes)]
                 over = draw_defects(over, draw_list)
-                st.image(cv2.cvtColor(over, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                st.image(cv2.cvtColor(over, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
 
             st.markdown("### Predictions")
             st.write({"glove_type": res.glove_type, "glove_type_score": round(res.glove_type_score, 3)})
@@ -122,7 +152,11 @@ def main() -> None:
                         if bgr is None:
                             continue
                         bgr = resize_max_side(bgr, max_side=1200)
-                        res = pipeline.infer(bgr)
+                        res = pipeline.infer(
+                            bgr,
+                            focus_only=bool(focus_only),
+                            allowed_labels=set(selected_labels) if selected_labels else None,
+                        )
                         over = overlay_mask(bgr, res.glove_mask)
                         draw_list = [d for d in res.defects if d.bbox is not None and passes_threshold(d.label, float(d.score))]
                         draw_list.sort(key=lambda d: float(d.score), reverse=True)
