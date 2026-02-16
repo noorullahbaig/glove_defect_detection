@@ -10,11 +10,18 @@ Run:
 
 Then place your captured images under:
 
-- `data/raw/nitrile/<defect_label>/...`
-- `data/raw/plastic/<defect_label>/...`
+- `data/raw/latex/<defect_label>/...`
+- `data/raw/leather/<defect_label>/...`
 - `data/raw/fabric/<defect_label>/...`
 
 And fill in `data/labels.csv`.
+
+## AI-generated dataset (optional)
+
+If you generate images with an external AI tool, keep them separate from `data/raw`:
+
+- `data/ai_generated/images/<glove_type>/<defect_label>/...`
+- `data/ai_generated/labels.csv`
 
 ## Curated manual test set
 

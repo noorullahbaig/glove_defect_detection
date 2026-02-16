@@ -83,7 +83,9 @@ cd "/Users/ayaanminhas/Desktop/IPPR Assignment"
 In `app/streamlit_app.py`:
 - structural min score default: `0.65`
 - surface/color min score default: `0.85`
-- focus mode default: enabled
+- defect dropdown supports either:
+  - `All` (run all defects)
+  - a single selected defect (run only that defect)
 
 Structural labels include:
 - `hole`
@@ -142,7 +144,7 @@ cd "/Users/ayaanminhas/Desktop/IPPR Assignment"
 
 Minimum columns:
 - `file`
-- `glove_type` (`nitrile`, `plastic`, `fabric`)
+- `glove_type` (`latex`, `leather`, `fabric`)
 - `defect_labels` (pipe-separated multi-label string)
 - `split` (`train`, `val`, `test`)
 - `lighting`
@@ -166,6 +168,7 @@ Optional column:
 - `improper_roll`
 - `incomplete_beading`
 - `missing_finger`
+- `extra_fingers`
 
 ## Project layout
 

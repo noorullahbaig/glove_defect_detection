@@ -21,30 +21,26 @@ lsof -nP -iTCP:8501 -sTCP:LISTEN
 
 If no process is listening, restart with the exact command above.
 
-## Single Image tab
+## Compare Uploads tab
 
-1) Upload a `.jpg`/`.png` image.
+1) Upload one or more `.jpg`/`.png` images and click **Add uploads**.
 2) The app runs:
    - preprocessing (illumination normalization + denoise)
    - glove segmentation (mask overlay)
-   - defect detection (red boxes + defect table)
+   - defect detection (boxes when available)
    - glove type (if a trained model is available)
 
 Outputs shown:
-- Left: original image
-- Right: segmentation overlay + defect boxes
-- Below: predicted glove type + list of defects and scores
+- Each uploaded image stays visible for side-by-side comparison.
+- A comparison table shows predicted glove type and defect scores.
 
 Default score filters:
 - Structural labels: min score `0.65`
 - Surface/color labels: min score `0.85`
 
-Focus mode (default labels):
-- `missing_finger`
-- `extra_fingers`
-- `hole`
-- `discoloration`
-- `damaged_by_fold`
+Defect dropdown:
+- Select **All** to run and display all defects.
+- Select a specific defect to run that defect only and show a single score for it.
 
 ## Batch Folder tab
 
@@ -60,7 +56,7 @@ Files written:
 
 ## Curated test set (quick verification)
 
-Use `data/my_test` to verify focus-mode behavior quickly:
+Use `data/my_test` to verify behavior quickly:
 - `missing_finger_4_fingers_and_one_cut_finger.png` -> expected `missing_finger`
 - `hole_on_fingertip.png` -> expected `hole`
 - `hole_in_the_middle.png` -> expected `hole`

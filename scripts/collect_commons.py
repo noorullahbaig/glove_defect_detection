@@ -205,19 +205,19 @@ def _title_ok_for_type(glove_type: str, title: str) -> bool:
     if any(x in t for x in exclude_all):
         return False
 
-    if glove_type == "nitrile":
-        include = ["nitrile"]
-        exclude = ["latex", "vinyl", "polyethylene", "plastic", "pe glove", "pe-glove"]
+    if glove_type == "latex":
+        include = ["latex glove", "latex", "surgical glove", "medical glove"]
+        exclude = ["nitrile", "vinyl", "polyethylene", "plastic", "leather glove", "work glove", "knit glove", "mitt", "mitten"]
         return any(x in t for x in include) and not any(x in t for x in exclude)
 
-    if glove_type == "plastic":
-        include = ["plastic glove", "polyethylene", "pe glove", "pe-glove", "vinyl glove", "vinyl"]
-        exclude = ["nitrile", "latex"]
+    if glove_type == "leather":
+        include = ["leather glove", "leather gloves", "driving glove", "biker glove", "motorcycle glove", "riding glove"]
+        exclude = ["nitrile", "latex", "vinyl glove", "polyethylene", "disposable glove", "disposable gloves", "knit glove"]
         return any(x in t for x in include) and not any(x in t for x in exclude)
 
     if glove_type == "fabric":
-        include = ["work glove", "work gloves", "garden glove", "gardening glove", "leather glove", "protective glove", "glove"]
-        exclude = ["nitrile", "latex", "vinyl glove", "polyethylene", "disposable glove", "disposable gloves"]
+        include = ["knit glove", "knitted glove", "fabric glove", "winter glove", "work glove", "work gloves", "garden glove", "gardening glove", "glove"]
+        exclude = ["nitrile", "latex", "vinyl glove", "polyethylene", "disposable glove", "disposable gloves", "leather glove"]
         return any(x in t for x in include) and not any(x in t for x in exclude)
 
     return True
@@ -260,17 +260,17 @@ def main() -> None:
 
     # Commons search syntax support can vary; use simple queries (multiple per type).
     queries: dict[str, list[str]] = {
-        "nitrile": ["nitrile glove", "disposable nitrile glove", "blue nitrile glove"],
-        "plastic": ["plastic glove", "vinyl glove", "polyethylene glove", "PE glove"],
-        "fabric": ["work glove", "work gloves", "garden glove", "gardening glove", "leather glove"],
+        "latex": ["latex glove", "surgical latex glove", "medical latex glove", "latex examination glove"],
+        "leather": ["leather glove", "driving glove", "motorcycle glove", "biker leather glove"],
+        "fabric": ["knit glove", "knitted glove", "fabric glove", "winter glove"],
     }
 
     categories = {
         # Keep categories narrow to avoid cross-contamination between glove types.
-        # Broad categories like "Disposable gloves" tend to mix nitrile/latex/vinyl/PE together.
-        "nitrile": [],
-        "plastic": ["Plastic gloves", "Disposable cooking gloves"],
-        "fabric": ["Work gloves", "Garden gloves", "Leather gloves"],
+        # Broad categories like "Disposable gloves" tend to mix latex/nitrile/vinyl/PE together.
+        "latex": [],
+        "leather": ["Leather gloves"],
+        "fabric": ["Work gloves", "Garden gloves"],
     }
 
     glove_types = list(queries.keys())

@@ -42,7 +42,7 @@ def main() -> None:
     ap.add_argument("--out-dir", default="data/public/trial_glove_defect", help="Folder to download into")
     ap.add_argument("--labels-out", default="data/trial_labels.csv", help="Write a trial labels CSV here")
     ap.add_argument("--split", default="test", choices=["train", "val", "test"], help="Split value for trial rows")
-    ap.add_argument("--glove-type", default="nitrile", help="Glove type label for all trial images (demo only).")
+    ap.add_argument("--glove-type", default="latex", help="Glove type label for all trial images (demo only).")
     ap.add_argument("--defect-label", default="spotting", help="Defect label to assign to all trial images (demo only).")
     args = ap.parse_args()
 

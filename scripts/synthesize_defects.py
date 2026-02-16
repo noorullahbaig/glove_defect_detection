@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gdd.core.image_io import read_image, resize_max_side
 from gdd.core.preprocess import preprocess
 from gdd.core.segmentation import segment_glove
+from gdd.core.labels import GLOVE_TYPES
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    for glove_type in ("nitrile", "plastic", "fabric"):
+    for glove_type in GLOVE_TYPES:
         # Support both:
         # - raw collectors: <in_dir>/<type>/images/*.jpg
         # - cleaned datasets: <in_dir>/images/<type>/*.png

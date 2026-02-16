@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-# Option C glove types: nitrile + cafeteria plastic (PE/vinyl) + work/leather glove.
-GLOVE_TYPES = ["nitrile", "plastic", "fabric"]
+# Final glove types (per project scope):
+# - latex: surgical latex glove (disposable)
+# - leather: leather glove
+# - fabric: knit fabric winter glove
+GLOVE_TYPES = ["latex", "leather", "fabric"]
 
 DEFECT_LABELS = [
     "discoloration",

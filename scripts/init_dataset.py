@@ -22,8 +22,8 @@ def main() -> None:
         df = pd.DataFrame(
             [
                 {
-                    "file": "data/raw/nitrile/normal/IMG_0001.jpg",
-                    "glove_type": "nitrile",
+                    "file": "data/raw/latex/normal/IMG_0001.jpg",
+                    "glove_type": "latex",
                     "defect_labels": "",
                     "split": "train",
                     "lighting": "daylight",
@@ -40,6 +40,7 @@ def main() -> None:
     Path("results").mkdir(parents=True, exist_ok=True)
     Path("results/overlays").mkdir(parents=True, exist_ok=True)
     Path("gdd/models").mkdir(parents=True, exist_ok=True)
+    Path("data/ai_generated/images").mkdir(parents=True, exist_ok=True)
     print("Dataset folders initialized.")
 
 

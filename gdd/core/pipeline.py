@@ -23,7 +23,11 @@ class GDDPipeline:
     def load_default(cls) -> "GDDPipeline":
         model = None
         if DEFAULT_GLOVE_TYPE_MODEL_PATH.exists():
-            model = load_glove_type_model(DEFAULT_GLOVE_TYPE_MODEL_PATH)
+            try:
+                model = load_glove_type_model(DEFAULT_GLOVE_TYPE_MODEL_PATH)
+            except Exception:
+                # Model may be stale (wrong classes or wrong feature length). Treat as missing.
+                model = None
         return cls(glove_type_model=model)
 
     def infer(
@@ -46,7 +50,10 @@ class GDDPipeline:
         glove_type_score = 0.0
         if self.glove_type_model is not None:
             feats = glove_type_features(bgr_p, seg.glove_mask, seg.glove_mask_filled)
-            glove_type, glove_type_score = self.glove_type_model.predict(feats)
+            try:
+                glove_type, glove_type_score = self.glove_type_model.predict(feats)
+            except Exception:
+                glove_type, glove_type_score = "unknown", 0.0
 
         return InferenceResult(
             glove_mask=seg.glove_mask,

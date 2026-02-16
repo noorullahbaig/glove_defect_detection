@@ -108,12 +108,12 @@ def _title_ok_for_type(glove_type: str, title: str) -> bool:
         return True
     if any(x in t for x in ["mitt", "mitten", "oven glove"]):
         return False
-    if glove_type == "nitrile":
-        return "nitrile" in t and "latex" not in t and "vinyl" not in t and "plastic" not in t
-    if glove_type == "plastic":
-        return any(x in t for x in ["plastic glove", "polyethylene", "vinyl glove", "pe glove", "poly glove"]) and "nitrile" not in t and "latex" not in t
+    if glove_type == "latex":
+        return "latex" in t and "nitrile" not in t and "vinyl" not in t and "polyethylene" not in t
+    if glove_type == "leather":
+        return "leather" in t and "latex" not in t and "nitrile" not in t and "vinyl" not in t
     if glove_type == "fabric":
-        return any(x in t for x in ["work glove", "work gloves", "garden glove", "gardening glove", "leather glove", "protective glove", "glove"])
+        return any(x in t for x in ["knit glove", "knitted glove", "fabric glove", "winter glove", "work glove", "garden glove", "gardening glove", "glove"]) and "leather" not in t
     return True
 
 
@@ -141,9 +141,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     queries: dict[str, list[str]] = {
-        "nitrile": ["nitrile glove", "blue nitrile glove", "disposable nitrile glove"],
-        "plastic": ["vinyl glove", "polyethylene glove", "plastic glove", "food service glove"],
-        "fabric": ["work glove", "work gloves", "gardening glove", "protective glove", "leather glove"],
+        "latex": ["latex glove", "surgical latex glove", "medical latex glove", "disposable latex glove"],
+        "leather": ["leather glove", "leather gloves", "driving glove", "biker leather glove"],
+        "fabric": ["knit glove", "knitted glove", "fabric glove", "winter glove"],
     }
 
     allowed_licenses = set(ALLOWED_LICENSES_BASE)

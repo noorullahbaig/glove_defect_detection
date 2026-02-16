@@ -19,6 +19,11 @@ class GloveTypeModel:
     clf: object
 
     def predict(self, features: np.ndarray) -> tuple[str, float]:
+        # Guard against stale models after feature engineering changes.
+        n_in = getattr(self.clf, "n_features_in_", None)
+        if n_in is not None and int(n_in) != int(features.reshape(1, -1).shape[1]):
+            raise ValueError(f"Feature length mismatch: model expects {int(n_in)}, got {int(features.size)}")
+
         x = features.reshape(1, -1)
         if hasattr(self.clf, "predict_proba"):
             probs = self.clf.predict_proba(x)[0]
@@ -74,4 +79,12 @@ def save_glove_type_model(model: GloveTypeModel, path: str | Path) -> None:
 
 def load_glove_type_model(path: str | Path) -> GloveTypeModel:
     obj = joblib.load(path)
-    return GloveTypeModel(encoder=obj["encoder"], clf=obj["clf"])
+    model = GloveTypeModel(encoder=obj["encoder"], clf=obj["clf"])
+    # If classes don't match current configured glove types, treat as incompatible.
+    try:
+        classes = set(str(x) for x in getattr(model.encoder, "classes_", []) or [])
+    except Exception:
+        classes = set()
+    if classes and classes != set(GLOVE_TYPES):
+        raise ValueError(f"Incompatible glove-type model classes: {sorted(classes)} (expected {GLOVE_TYPES})")
+    return model

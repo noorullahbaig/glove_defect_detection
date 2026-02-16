@@ -20,6 +20,24 @@ class DefectDetectionContext:
 def _clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
+
+def _zero_anomaly_like(mask01: np.ndarray) -> AnomalyMaps:
+    z = np.zeros(mask01.shape[:2], dtype=np.float32)
+    return AnomalyMaps(color=z, texture=z, edges=z, combined=z)
+
+
+FOCUS_LABELS = {"missing_finger", "extra_fingers", "hole", "discoloration", "damaged_by_fold"}
+
+LABEL_GROUP_HOLES = {"hole", "tear"}
+LABEL_GROUP_SURFACE = {"stain_dirty", "spotting", "plastic_contamination"}  # discoloration handled separately
+LABEL_GROUP_WRINKLE = {"wrinkles_dent", "damaged_by_fold"}
+LABEL_GROUP_CUFF = {"improper_roll", "incomplete_beading"}
+LABEL_GROUP_FINGERS = {"missing_finger", "extra_fingers"}
+
+# Labels whose detector(s) require the anomaly maps.
+LABELS_NEED_ANOMALY = set(LABEL_GROUP_SURFACE) | set(LABEL_GROUP_WRINKLE)
+
+
 def _rotate_mask_to_upright(mask01: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
     """
     Rotate the binary mask so the main axis of the glove is roughly vertical.
@@ -1002,27 +1020,61 @@ def detect_defects(
     focus_only: bool = False,
     allowed_labels: set[str] | None = None,
 ) -> tuple[list[Defect], AnomalyMaps]:
-    anomaly = build_anomaly_maps(bgr, glove_mask)
-    ctx = DefectDetectionContext(
-        bgr=bgr,
-        glove_mask=glove_mask,
-        glove_mask_filled=glove_mask_filled,
-        anomaly=anomaly,
-    )
+    req: set[str] | None = None
+    if allowed_labels is not None:
+        req = set(str(x) for x in allowed_labels)
+    if focus_only:
+        req = set(FOCUS_LABELS) if req is None else (req & set(FOCUS_LABELS))
+
+    # Decide whether we need anomaly maps (expensive) based on requested labels.
+    need_anom = True if req is None else bool(req & LABELS_NEED_ANOMALY)
+    anomaly = build_anomaly_maps(bgr, glove_mask) if need_anom else _zero_anomaly_like(glove_mask)
+    ctx = DefectDetectionContext(bgr=bgr, glove_mask=glove_mask, glove_mask_filled=glove_mask_filled, anomaly=anomaly)
 
     defects: list[Defect] = []
-    if focus_only:
-        defects.extend([d for d in _detect_holes(bgr, glove_mask, glove_mask_filled) if d.label == "hole"])
-        defects.extend(_discoloration_only(ctx))
-        defects.extend([d for d in _edge_fold_wrinkle(ctx) if d.label == "damaged_by_fold"])
-        defects.extend(_finger_count_anomaly(ctx))
-    else:
+    # Compute only the detector groups needed for the requested label set.
+    if req is None:
+        # "All labels" mode.
         defects.extend(_detect_holes(bgr, glove_mask, glove_mask_filled))
         defects.extend(_spot_stain_discoloration(ctx))
         defects.extend(_edge_fold_wrinkle(ctx))
         defects.extend(_roll_and_beading(ctx))
         defects.extend(_finger_count_anomaly(ctx))
         defects.extend(_inside_out(ctx))
+    else:
+        if req & LABEL_GROUP_HOLES:
+            holes = _detect_holes(bgr, glove_mask, glove_mask_filled)
+            # Keep only the requested subset (hole/tear) for this detector.
+            holes = [d for d in holes if d.label in req]
+            defects.extend(holes)
+
+        # Discoloration has a dedicated detector that doesn't require anomaly maps.
+        if "discoloration" in req:
+            defects.extend(_discoloration_only(ctx))
+
+        if req & LABEL_GROUP_SURFACE:
+            surf = _spot_stain_discoloration(ctx)
+            surf = [d for d in surf if d.label in req]
+            defects.extend(surf)
+
+        if req & LABEL_GROUP_WRINKLE:
+            wr = _edge_fold_wrinkle(ctx)
+            wr = [d for d in wr if d.label in req]
+            defects.extend(wr)
+
+        if req & LABEL_GROUP_CUFF:
+            cuff = _roll_and_beading(ctx)
+            cuff = [d for d in cuff if d.label in req]
+            defects.extend(cuff)
+
+        if (req & LABEL_GROUP_FINGERS) or ("hole" in req):
+            # Finger-count detector can sometimes label fingertip truncation as "hole".
+            fc = _finger_count_anomaly(ctx)
+            fc = [d for d in fc if d.label in req]
+            defects.extend(fc)
+
+        if "inside_out" in req:
+            defects.extend(_inside_out(ctx))
 
     # De-duplicate by label (keep max score) but keep bboxes for localized defects.
     best: dict[str, Defect] = {}

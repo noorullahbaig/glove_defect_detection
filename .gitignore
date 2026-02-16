@@ -14,6 +14,7 @@ env/
 # Data + artifacts (keep structure, not contents)
 data/raw/
 data/public/
+data/ai_generated/images/
 data/processed/
 data/tmp/
 results/
