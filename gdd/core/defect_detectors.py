@@ -246,6 +246,8 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
     mf = (glove_mask_filled > 0).astype(np.uint8)
     glove_area = float(mf.sum()) + 1e-6
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    fallback_used = False
+    dt_mf: np.ndarray | None = None
 
     core = cv2.erode(mf, np.ones((9, 9), np.uint8), iterations=1)
     if core.sum() < 100:
@@ -265,6 +267,41 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
     bg_med = np.median(lab[bg_mask > 0], axis=0) if bg_mask.sum() else glove_med.copy()
 
     holes = ((mf > 0) & (m == 0)).astype(np.uint8)
+    if holes.sum() == 0 and mf.sum() > 0:
+        # Fallback: some segmentations paint over interior voids (especially bright holes),
+        # so explicitly search for background-like pixels inside the filled silhouette.
+        fallback_used = True
+        d_bg_px = np.linalg.norm(lab - bg_med.reshape(1, 1, 3), axis=2)
+        d_gl_px = np.linalg.norm(lab - glove_med.reshape(1, 1, 3), axis=2)
+        l_diff = np.abs(lab[:, :, 0] - float(glove_med[0]))
+        dt_mf = cv2.distanceTransform((mf * 255).astype(np.uint8), cv2.DIST_L2, 5)
+        # CLAHE (used in preprocess) can flip the apparent brightness of the hole/background region.
+        # Use a symmetric gate so we keep both "brighter than glove" and "darker than glove" candidates.
+        l_gate = (l_diff >= 10.0)
+
+        # Adaptive background distance threshold:
+        # estimate how "tight" the background color is far away from the glove boundary,
+        # then accept interior candidates that are within a multiple of that typical spread.
+        inv = (mf == 0).astype(np.uint8)
+        dt_bg = cv2.distanceTransform((inv * 255).astype(np.uint8), cv2.DIST_L2, 5)
+        bg_far = (inv > 0) & (dt_bg >= max(12.0, 0.02 * float(min(mf.shape[:2]))))
+        if int(bg_far.sum()) >= 200:
+            bg_d = d_bg_px[bg_far]
+            # Use a mid-high percentile to avoid being dominated by CLAHE artifacts in flat backgrounds.
+            # If we pick too high a percentile, we accept glove highlights as "background-like" and
+            # create huge connected components.
+            bg_p80 = float(np.percentile(bg_d, 80))
+            thr_bg = float(np.clip(bg_p80 * 1.8, 18.0, 45.0))
+        else:
+            thr_bg = 26.0
+
+        holes = (
+            (mf > 0)
+            & (dt_mf >= 4.0)
+            & (d_bg_px <= thr_bg)
+            & ((d_bg_px + 4.0) < d_gl_px)
+            & l_gate
+        ).astype(np.uint8)
     if holes.sum() == 0:
         return []
     holes = cv2.morphologyEx(holes, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
@@ -273,12 +310,18 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
     # Cuff/opening suppression: ignore a very large "hole" near the bottom band
     # (often just the glove opening showing background).
     ys = np.where(mf > 0)[0]
+    xs = np.where(mf > 0)[1]
     if ys.size:
         y0, y1 = int(ys.min()), int(ys.max())
         gh = max(1, y1 - y0 + 1)
         cuff_y = y1 - int(round(0.18 * gh))
     else:
         cuff_y = int(mf.shape[0] * 0.85)
+    if xs.size:
+        x0, x1 = int(xs.min()), int(xs.max())
+        gw = max(1, x1 - x0 + 1)
+    else:
+        gw = mf.shape[1]
 
     for i in range(1, num):
         x, y, w, h, area = [int(v) for v in stats[i].tolist()]
@@ -289,20 +332,52 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
         area_norm = float(area) / glove_area
 
         cy = y + (h / 2.0)
-        if cy >= float(cuff_y) and area_norm > 0.02:
+        if cy >= float(cuff_y):
             # Likely cuff opening rather than a puncture/hole defect.
-            continue
+            if area_norm > 0.02:
+                continue
+            # Some segmentations leak a smaller-but-wide background region at the opening.
+            if float(w) >= 0.22 * float(gw) and area_norm > 0.004:
+                continue
 
         comp = (labels == i).astype(np.uint8)
         hole_med = np.median(lab[comp > 0], axis=0) if comp.sum() else glove_med
         d_bg = float(np.linalg.norm(hole_med - bg_med))
         d_glove = float(np.linalg.norm(hole_med - glove_med))
-        l_delta = float(glove_med[0] - hole_med[0])
+        l_abs = float(abs(float(glove_med[0]) - float(hole_med[0])))
 
         # Reject color anomalies that are not background-like (common false "hole" on stains/discoloration).
-        if not (d_bg + 3.0 < d_glove and l_delta > 8.0):
+        if not (d_bg + 3.0 < d_glove and l_abs > 8.0):
             if area_norm > 0.003:
                 continue
+
+        if fallback_used:
+            # In fallback mode we are essentially "reverse segmenting" interior background pixels.
+            # Be strict to avoid picking up leather highlights/seams.
+            # 1) Surrounding ring should be non-background (so we don't pick a random patch of table),
+            # and the candidate should be meaningfully different from that ring.
+            ring2 = cv2.dilate(comp, np.ones((9, 9), np.uint8), iterations=1) - comp
+            ring2 = (ring2 > 0).astype(np.uint8)
+            ring2 = (ring2 & mf).astype(np.uint8)
+            if int(ring2.sum()) >= 40:
+                ring_med = np.median(lab[ring2 > 0], axis=0)
+                ring_d_bg = float(np.linalg.norm(ring_med - bg_med))
+                de_ring = float(np.linalg.norm(hole_med - ring_med))
+                # Ring should not look like background, and the component should stand out from ring.
+                if not (ring_d_bg >= 14.0 and de_ring >= 16.0 and (d_bg + 6.0) < ring_d_bg):
+                    continue
+
+            # 2) Very small blobs are almost always specular highlights.
+            if area_norm < 0.00035:
+                continue
+
+            # 3) Keep a distance-to-boundary summary for later ranking.
+            if dt_mf is not None and int(comp.sum()) > 0:
+                mean_dt = float(dt_mf[comp > 0].mean())
+            else:
+                mean_dt = 0.0
+        else:
+            mean_dt = 0.0
 
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
@@ -311,6 +386,12 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
             circ = float((4.0 * np.pi * float(area)) / (peri * peri))
         else:
             circ = 0.0
+
+        if fallback_used:
+            # Specular highlights and small seam gaps can look "background-like" on leather/fabric,
+            # but they rarely form a compact closed shape. Enforce moderate circularity for holes.
+            if aspect < 2.2 and float(circ) < 0.50:
+                continue
 
         # Confidence heuristic: bigger voids + high circularity are strong evidence.
         size_score = min(1.0, area_norm / 0.008)  # 0.8% of glove area → max confidence
@@ -329,6 +410,7 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
                         "area_norm": area_norm,
                         "d_bg": d_bg,
                         "d_glove": d_glove,
+                        "mean_dt": mean_dt,
                     },
                 )
             )
@@ -346,9 +428,21 @@ def _detect_holes(bgr: np.ndarray, glove_mask: np.ndarray, glove_mask_filled: np
                         "area_norm": area_norm,
                         "d_bg": d_bg,
                         "d_glove": d_glove,
+                        "mean_dt": mean_dt,
                     },
                 )
             )
+    # If the segmentation gives us true interior voids (holes_direct path),
+    # multiple disconnected voids are plausible for perforations. Keep them all.
+    # If we're in fallback mode (segmenter painted over the hole), the candidate
+    # set tends to include specular highlights; be conservative and keep only one
+    # best hole/tear for the image.
+    if fallback_used and out:
+        holes_out = [d for d in out if d.label == "hole"]
+        if not holes_out:
+            return []
+        # In fallback mode, hole-vs-tear distinction is unreliable; return the strongest hole-like candidate.
+        return [max(holes_out, key=lambda d: float(d.score))]
     return out
 
 
@@ -479,9 +573,11 @@ def _spot_stain_discoloration(ctx: DefectDetectionContext) -> list[Defect]:
     if vals.size == 0:
         return []
     med = np.median(vals, axis=0)
+    # Distance-to-boundary to suppress edge-driven artifacts.
+    dt = cv2.distanceTransform((mask01 * 255).astype(np.uint8), cv2.DIST_L2, 5)
 
     out: list[Defect] = []
-    small_spots = 0
+    dark_spots = 0
     glove_area = float(mask01.sum()) + 1e-6
     for i in range(1, stats.shape[0]):
         x, y, w, h, area = [int(v) for v in stats[i].tolist()]
@@ -491,8 +587,13 @@ def _spot_stain_discoloration(ctx: DefectDetectionContext) -> list[Defect]:
         if area > 0.25 * glove_area:
             continue
         blob = (labels == i).astype(np.uint8)
+        # Suppress boundary-driven blobs (common on segmentation edges and shadows).
+        if blob.sum():
+            if float(np.median(dt[blob > 0])) < 3.2:
+                continue
         mean_de = float(ctx.anomaly.color[blob > 0].mean()) if blob.sum() else 0.0
-        if mean_de < 0.35:
+        # Tighten slightly to reduce noisy false positives on textured AI images.
+        if mean_de < 0.42:
             continue
         bbox = BoundingBox(x=x, y=y, w=w, h=h)
 
@@ -506,31 +607,48 @@ def _spot_stain_discoloration(ctx: DefectDetectionContext) -> list[Defect]:
 
         # Heuristic label based on size and brightness change.
         if area <= 180 and max(w, h) <= 30:
-            small_spots += 1
-            # Plastic contamination tends to be specular/bright and tiny.
-            if delta_L > 0.10:
-                out.append(Defect(label="plastic_contamination", score=_clamp01(0.55 + 0.5 * mean_de), bbox=bbox))
+            # Separate dark speckle spotting from bright specular specks.
+            if delta_L < -0.06:
+                dark_spots += 1
+            # Plastic contamination tends to be bright/specular with low chroma shift.
+            if delta_L > 0.12 and mean_de_ab < 14.0:
+                out.append(
+                    Defect(
+                        label="plastic_contamination",
+                        score=_clamp01(0.50 + 0.55 * mean_de),
+                        bbox=bbox,
+                        meta={"delta_L": float(delta_L), "mean_de_ab": float(mean_de_ab)},
+                    )
+                )
             continue
 
         if area >= 0.015 * glove_area:
             # Large area: discoloration vs stain/dirty via brightness direction.
             if delta_L < -0.06:
+                # If it's mostly a brightness drop with little chroma shift, it's often just shadow.
+                if mean_de_ab < 7.0 and mean_de < 0.65:
+                    continue
                 out.append(Defect(label="stain_dirty", score=_clamp01(0.50 + 0.5 * mean_de), bbox=bbox))
             else:
                 # Prefer discoloration when chroma differs (not just bright/dim).
                 chroma_boost = min(0.25, mean_de_ab / 45.0)
                 out.append(Defect(label="discoloration", score=_clamp01(0.55 + 0.45 * mean_de + chroma_boost), bbox=bbox))
         else:
-            # Medium blobs are usually stains/dirty spots.
-            out.append(Defect(label="stain_dirty", score=_clamp01(0.50 + 0.5 * mean_de), bbox=bbox))
+            # Medium blobs: favor stain when darker; otherwise consider discoloration if chroma differs.
+            if delta_L < -0.03:
+                out.append(Defect(label="stain_dirty", score=_clamp01(0.48 + 0.55 * mean_de), bbox=bbox))
+            else:
+                chroma_boost = min(0.22, mean_de_ab / 55.0)
+                out.append(Defect(label="discoloration", score=_clamp01(0.50 + 0.50 * mean_de + chroma_boost), bbox=bbox))
 
-    if small_spots >= 6:
+    # Spotting should be multiple dark speckles, not just texture noise.
+    if dark_spots >= 8:
         out.append(
             Defect(
                 label="spotting",
-                score=_clamp01(min(0.95, 0.35 + 0.08 * small_spots)),
+                score=_clamp01(min(0.95, 0.30 + 0.07 * dark_spots)),
                 bbox=None,
-                meta={"count": small_spots},
+                meta={"count": dark_spots},
             )
         )
     return out
@@ -1067,11 +1185,18 @@ def detect_defects(
             cuff = [d for d in cuff if d.label in req]
             defects.extend(cuff)
 
-        if (req & LABEL_GROUP_FINGERS) or ("hole" in req):
-            # Finger-count detector can sometimes label fingertip truncation as "hole".
+        if req & LABEL_GROUP_FINGERS:
             fc = _finger_count_anomaly(ctx)
             fc = [d for d in fc if d.label in req]
             defects.extend(fc)
+        elif "hole" in req:
+            # Only run finger-count-as-hole fallback when hole detector didn't find any holes.
+            # Otherwise it can override the true puncture location with a spurious fingertip anomaly.
+            have_hole = any(d.label == "hole" for d in defects)
+            if not have_hole:
+                fc = _finger_count_anomaly(ctx)
+                fc = [d for d in fc if d.label in req]
+                defects.extend(fc)
 
         if "inside_out" in req:
             defects.extend(_inside_out(ctx))
@@ -1101,4 +1226,9 @@ def detect_defects(
     if allowed_labels is not None:
         allowed = set(str(x) for x in allowed_labels)
         out = [d for d in out if d.label in allowed]
+        # For "one defect at a time" UX, keep only the best hole candidate when the user
+        # explicitly requests just `hole` (avoids clutter from segmentation artifacts).
+        if allowed == {"hole"}:
+            out.sort(key=lambda x: float(x.score), reverse=True)
+            out = out[:1]
     return out, anomaly

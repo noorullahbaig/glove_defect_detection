@@ -10,10 +10,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from gdd.core.defect_detectors import detect_defects
 from gdd.core.dataset import load_labels_csv, parse_defect_labels, validate_labels_df
 from gdd.core.image_io import read_image, resize_max_side
 from gdd.core.labels import DEFECT_LABELS
-from gdd.core.pipeline import GDDPipeline
+from gdd.core.preprocess import preprocess
+from gdd.core.segmentation import segment_glove
+from gdd.core.viz import draw_defects, overlay_mask
 
 
 STRUCTURAL_LABELS = {
@@ -57,6 +60,8 @@ def main() -> None:
     ap.add_argument("--min-struct-score", type=float, default=0.65)
     ap.add_argument("--min-surface-score", type=float, default=0.85)
     ap.add_argument("--limit-failures", type=int, default=8, help="How many FP/FN examples to list per defect")
+    ap.add_argument("--write-overlays", action="store_true", help="Write overlay images for top FP/FN cases under results/overlays/per_defect/")
+    ap.add_argument("--max-overlays", type=int, default=4, help="Max FP and FN overlays per defect (each)")
     args = ap.parse_args()
 
     df = load_labels_csv(args.labels)
@@ -79,13 +84,26 @@ def main() -> None:
             return test_df[test_df["glove_type"].astype(str) == "latex"].copy()
         return test_df
 
-    pipeline = GDDPipeline.load_default()
+    # Precompute preprocess + segmentation once per test image to make per-defect runs fast.
+    cache: dict[str, dict] = {}
+    for _, row in test_df.iterrows():
+        path = str(row["file"])
+        img = read_image(path).bgr
+        img = resize_max_side(img, max_side=int(args.max_side))
+        bgr_p = preprocess(img)
+        seg = segment_glove(bgr_p)
+        cache[path] = {
+            "bgr_p": bgr_p,
+            "glove_mask": seg.glove_mask,
+            "glove_mask_filled": seg.glove_mask_filled,
+        }
 
     per_file_rows: list[dict] = []
     summaries: list[DefectEvalSummary] = []
     failure_examples: dict[str, dict[str, list[tuple[str, float]]]] = {}
 
     for lab in DEFECT_LABELS:
+        print(f"[eval] defect={lab}", flush=True)
         tdf = applicable_rows(lab)
         if tdf.empty:
             continue
@@ -101,10 +119,18 @@ def main() -> None:
             true_def = set(parse_defect_labels(str(row.get("defect_labels", ""))))
             is_pos = (lab in true_def)
 
-            img = read_image(path).bgr
-            img = resize_max_side(img, max_side=int(args.max_side))
-            res = pipeline.infer(img, focus_only=False, allowed_labels={lab})
-            lab_scores = [float(d.score) for d in res.defects if str(d.label) == lab]
+            it = cache.get(path)
+            if it is None:
+                continue
+
+            defects, _anom = detect_defects(
+                it["bgr_p"],
+                it["glove_mask"],
+                it["glove_mask_filled"],
+                focus_only=False,
+                allowed_labels={lab},
+            )
+            lab_scores = [float(d.score) for d in defects if str(d.label) == lab]
             score = float(max(lab_scores)) if lab_scores else 0.0
             pred_pos = bool(passes_threshold(lab, score))
 
@@ -181,9 +207,64 @@ def main() -> None:
     per_file_path = out_dir / "per_defect_per_file.csv"
     per_file.to_csv(per_file_path, index=False)
 
+    if bool(args.write_overlays):
+        ov_dir = out_dir / "overlays" / "per_defect"
+        ov_dir.mkdir(parents=True, exist_ok=True)
+
+        def _badge(bgr, text: str) -> None:
+            import cv2
+            cv2.rectangle(bgr, (10, 10), (10 + 760, 10 + 44), (0, 0, 0), -1)
+            cv2.putText(bgr, text, (18, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+        for lab in DEFECT_LABELS:
+            ex = failure_examples.get(lab) or {}
+            for kind in ("fp", "fn"):
+                items = (ex.get(kind) or [])[: int(args.max_overlays)]
+                for idx, (pth, sc) in enumerate(items):
+                    try:
+                        img = read_image(pth).bgr
+                    except Exception:
+                        continue
+                    img = resize_max_side(img, max_side=int(args.max_side))
+                    bgr_p = preprocess(img)
+                    seg = segment_glove(bgr_p)
+                    defects, _anom = detect_defects(
+                        bgr_p,
+                        seg.glove_mask,
+                        seg.glove_mask_filled,
+                        focus_only=False,
+                        allowed_labels={lab},
+                    )
+                    over = overlay_mask(img, seg.glove_mask)
+                    boxed = [d for d in defects if d.bbox is not None]
+                    over = draw_defects(over, boxed)
+                    _badge(over, f"{lab} {kind.upper()} score={sc:.3f} file={Path(pth).name}")
+                    outp = ov_dir / lab / kind
+                    outp.mkdir(parents=True, exist_ok=True)
+                    import cv2
+                    cv2.imwrite(str(outp / f"{idx:02d}.png"), over)
+
     # Markdown report.
     out_md = Path(args.out_md)
     out_md.parent.mkdir(parents=True, exist_ok=True)
+
+    def _md_table(df: pd.DataFrame, cols: list[str]) -> str:
+        view = df[cols].copy()
+        # Basic, dependency-free markdown table.
+        header = "| " + " | ".join(cols) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        rows = []
+        for _, r in view.iterrows():
+            vals = []
+            for c in cols:
+                v = r[c]
+                if isinstance(v, float):
+                    vals.append(f"{v:.3f}")
+                else:
+                    vals.append(str(v))
+            rows.append("| " + " | ".join(vals) + " |")
+        return "\n".join([header, sep] + rows)
+
     lines: list[str] = []
     lines.append("# Per-Defect Evaluation Report")
     lines.append("")
@@ -194,7 +275,25 @@ def main() -> None:
     lines.append("")
     lines.append("## Summary (sorted by weakest F1)")
     lines.append("")
-    lines.append(sm_df.to_markdown(index=False))
+    lines.append(
+        _md_table(
+            sm_df,
+            cols=[
+                "label",
+                "n_pos",
+                "n_neg",
+                "tp",
+                "fp",
+                "fn",
+                "tn",
+                "precision",
+                "recall",
+                "f1",
+                "avg_score_pos",
+                "avg_score_neg",
+            ],
+        )
+    )
     lines.append("")
     lines.append("## Failure Examples (Top FP/FN per defect)")
     lines.append("")
@@ -217,13 +316,41 @@ def main() -> None:
             lines.append("- No FP/FN examples recorded.")
         lines.append("")
 
+    lines.append("## Recommendations (Data To Add / Prompt Fixes)")
+    lines.append("")
+    lines.append("This dataset is small, so many defects have only 1–3 positive test samples. For stable metrics, target **at least 6 images per (glove_type, defect)**,")
+    lines.append("so that you reliably get 1–2 positives in the test split per category.")
+    lines.append("")
+    for s in sorted(summaries, key=lambda x: (x.f1, x.label)):
+        lab = s.label
+        recs: list[str] = []
+        if s.n_pos < 3:
+            recs.append(f"Add more positives: currently n_pos={s.n_pos} in test. Generate 6–10 total images for `{lab}` across glove types.")
+        if lab == "tear":
+            recs.append("Prompt tweak: make the tear show background through the rip (a true void). The current tear detector relies on missing mask pixels inside the glove silhouette.")
+        if lab in {"extra_fingers", "missing_finger"}:
+            recs.append("Prompt tweak: top-down, glove lying flat, high-contrast background, and make the finger count visually unambiguous in the silhouette (no motion blur, no occlusion).")
+        if lab == "inside_out":
+            recs.append("Prompt tweak: emphasize turned-inside-out seams/inner structure clearly visible on the outside; avoid smooth exterior-looking renders.")
+        if lab in {"stain_dirty", "spotting", "plastic_contamination"}:
+            recs.append("Add more `normal` images too (per glove type). These defects are prone to false positives on AI textures; more clean negatives help tuning and evaluation.")
+        if lab in {"improper_roll", "incomplete_beading"}:
+            recs.append("Latex-only: generate only on latex gloves, with the cuff region large in frame (glove opening visible).")
+
+        if recs:
+            lines.append(f"### `{lab}`")
+            for r in recs:
+                lines.append(f"- {r}")
+            lines.append("")
+
     out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     print(f"Wrote: {out_csv}")
     print(f"Wrote: {per_file_path}")
     print(f"Wrote: {out_md}")
+    if bool(args.write_overlays):
+        print(f"Wrote overlays under: {out_dir / 'overlays' / 'per_defect'}")
 
 
 if __name__ == "__main__":
     main()
-
