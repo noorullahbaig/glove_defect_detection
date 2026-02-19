@@ -8,7 +8,7 @@ from .defect_detectors import detect_defects
 from .features import glove_type_features
 from .glove_type_model import GloveTypeModel, load_glove_type_model
 from .preprocess import preprocess
-from .segmentation import segment_glove
+from .segmentation import SegmentationConfig, segment_glove
 from .types import InferenceResult
 
 
@@ -35,9 +35,10 @@ class GDDPipeline:
         bgr: np.ndarray,
         focus_only: bool = False,
         allowed_labels: set[str] | None = None,
+        seg_cfg: SegmentationConfig | None = None,
     ) -> InferenceResult:
         bgr_p = preprocess(bgr)
-        seg = segment_glove(bgr_p)
+        seg = segment_glove(bgr_p, cfg=seg_cfg)
         defects, _anom = detect_defects(
             bgr_p,
             seg.glove_mask,
