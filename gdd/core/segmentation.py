@@ -19,8 +19,14 @@ class SegmentationConfig:
     Optional knobs for tuning segmentation strictness (used by the Streamlit UI).
     """
 
-    force_candidate: str | None = None  # {"bg_dist","kmeans","labL_hi","labL_lo","edge_closed"}
+    force_candidate: str | None = None  # {"bg_dist","kmeans","labL_hi","labL_lo","edge_closed","chroma_fg","texture_fg"}
     force_refine: str | None = None  # {"grabcut","watershed"}
+    profile_name: str = "balanced"
+    gap_carve_mode: str = "hybrid"  # {"evidence","geometry","hybrid"}
+
+    # Candidate validity gates (primarily for low-chroma/near-white gloves).
+    chroma_min_area_frac: float = 0.20
+    chroma_min_iou_silhouette: float = 0.25
 
     grabcut_cap_border_touch: float = 0.10
     grabcut_open_k: int = 3
@@ -71,6 +77,79 @@ class SegmentationConfig:
     reach_carve_strength: float = 1.0  # 0 disables; higher carves more aggressively
     reach_carve_max_rm_frac: float = 0.08  # max fraction of mask area removed per pass
 
+    # Boundary pruning controls.
+    boundary_prune_enabled: bool = True
+    boundary_prune_edge_rescue: bool = True
+    boundary_prune_skip_if_low_leak: bool = True
+
+    # Gap carve safety controls.
+    gap_geometry_fallback_solidity: float = 0.90
+    gap_max_remove_frac: float = 0.06
+
+    # Global post-cleanup for residual boundary halos on white backgrounds.
+    global_halo_peel_enabled: bool = True
+    global_halo_peel_trigger_ratio: float = 0.14
+    global_halo_peel_max_remove_frac: float = 0.10
+    global_halo_peel_dt_frac: float = 0.030
+
+    # Conservative post-expand to recover clipped fingertips (mostly leather).
+    tip_restore_enabled: bool = True
+    tip_restore_max_add_frac: float = 0.015
+
+    # Fingertip protection: prevents downstream refinement/carving from trimming
+    # narrow finger tips that are already present in a good candidate.
+    # Implemented as a soft "keep" band on the likely fingertip end of the mask.
+    tip_protect_enabled: bool = True
+    tip_protect_frac: float = 0.18  # fraction of glove length to protect at the fingertip end
+    tip_protect_dilate_frac: float = 0.006  # small dilation of protected pixels (fraction of min(h,w))
+
+    # Upright variant acceptance guard: refuse an upright refinement that discards
+    # too much of the current fingertip band (helps stop cascaded tip clipping).
+    upright_min_tip_retain: float = 0.92
+
+    # ── Type-aware segmentation strategy ────────────────────────────────
+    # Per-candidate score adjustments: {candidate_name: bonus} (e.g. {"edge_closed": 0.12}).
+    candidate_boost: tuple = ()   # tuple of (name, bonus) pairs — frozen-safe
+    candidate_suppress: tuple = ()  # tuple of (name, penalty) pairs
+
+    # Type-specific candidate enables.
+    latex_edge_multiscale: bool = False  # multi-scale Canny edge-closed candidate
+    leather_saturation_candidate: bool = False  # HSV saturation-based candidate
+    fabric_variance_candidate: bool = False  # local variance texture candidate
+
+    # GrabCut seeding geometry (fractions of min(h,w)).
+    grabcut_erode_frac: float = 0.012  # sure_fg erosion — smaller = more tip pixels in sure_fg
+    grabcut_dilate_frac: float = 0.020  # prob_fg dilation — larger = more tip pixels as prob_fg
+    grabcut_sure_bg_dilate_frac: float = 0.09  # sure_bg outer shell
+    grabcut_inter_min_ratio: float = 0.78  # if init&aux overlap is too small, fall back to init for sure_fg
+    # Post-GrabCut candidate-based cap: limit GrabCut expansion to dilated candidate.
+    # 0.0 = disabled; positive = fraction of min(h,w) for candidate dilation.
+    grabcut_candidate_cap_frac: float = 0.0
+
+    # GrabCut tri-map seeding (multi-level Otsu on background-distance).
+    grabcut_trimap_enabled: bool = False
+    grabcut_trimap_classes: int = 3
+    grabcut_trimap_only_if_low_confidence: bool = True
+    grabcut_trimap_low_conf_bg_sep: float = 22.0
+    grabcut_trimap_low_conf_edge_align: float = 0.10
+
+    # Optional Chan–Vese candidate (region-based; useful for weak edges).
+    chan_vese_enabled: bool = False
+    chan_vese_max_side: int = 512
+    chan_vese_iters: int = 80
+    chan_vese_smoothing: int = 2
+    chan_vese_only_if_low_confidence: bool = True
+    chan_vese_low_conf_bg_sep: float = 22.0
+    chan_vese_low_conf_edge_align: float = 0.10
+
+    # Shape plausibility tie-breaker in candidate scoring.
+    shape_plausibility_enabled: bool = True
+    shape_plausibility_weight: float = 0.08
+
+    # Edge-based finger separation: uses Canny edges to carve inter-finger
+    # gaps and recover clipped fingertips.
+    edge_finger_separation_enabled: bool = False
+
 
 @dataclass(frozen=True)
 class SegmentationDebug:
@@ -89,6 +168,11 @@ class SegmentationDebug:
     edges_u8: np.ndarray  # uint8 0 or 255
     candidates: dict[str, np.ndarray]  # method -> mask01
     scored: list[dict]  # list of {method, score, metrics...}
+    candidate_validity: dict[str, dict[str, float | bool]]
+    carve_stats: dict[str, float | str]
+    prune_stats: dict[str, float | bool | str]
+    grabcut_trimap_use: bool
+    grabcut_trimap: dict[str, float | int | bool | str]
     chosen_method: str
 
 
@@ -208,7 +292,7 @@ def _edge_reachable_bg_carve(
 
     # Combine chroma-based reachable background with an edge-barrier reachability.
     # Edge reachability helps for reflections (latex) where background pixels are not strictly bg-like.
-    reach_bg = _reachable_background_mask(sig, strictness=float(cfg.shadow_strictness))
+    reach_bg = _reachable_background_mask(sig, strictness=float(cfg.shadow_strictness), cfg=cfg, roi01=roi01)
     reach_edge = _edge_reachable_map(sig, strength=float(strength))
     reachable = ((reach_bg > 0) | (reach_edge > 0)).astype(np.uint8)
     if reachable.sum() < 500:
@@ -440,6 +524,106 @@ def _bg_like_inside_ratio(mask01: np.ndarray, sig: _SegSignals, roi01: np.ndarra
     return float(np.sum(bg_like & sel)) / float(denom + 1e-6)
 
 
+def _global_boundary_halo_peel(
+    mask01: np.ndarray,
+    sig: _SegSignals,
+    cfg: SegmentationConfig,
+    runtime: dict[str, object] | None = None,
+) -> np.ndarray:
+    m = (mask01 > 0).astype(np.uint8)
+    if m.sum() < 500 or not bool(cfg.global_halo_peel_enabled):
+        return m
+    h, w = m.shape[:2]
+    core_k = max(5, int(round(0.012 * min(h, w))))
+    core = cv2.erode(m, _k(core_k), iterations=1)
+    boundary = (m & (1 - core)).astype(np.uint8)
+    if boundary.sum() < 120:
+        return m
+
+    border_vals = sig.d_bg_u8[sig.border_mask01 > 0]
+    if border_vals.size >= 80:
+        bg_like_thr = float(np.percentile(border_vals, float(cfg.bg_like_percentile)) + float(cfg.bg_like_margin))
+        bg_like_thr = float(max(6.0, min(80.0, bg_like_thr)))
+    else:
+        bg_like_thr = _bg_like_thr_u8(sig)
+    bg_like = (sig.d_bg_u8.astype(np.float32) <= float(bg_like_thr)).astype(np.uint8)
+    shadow = _shadow_like_mask_anywhere(sig, strictness=float(cfg.shadow_strictness))
+    reach_bg = _reachable_background_mask(sig, strictness=float(cfg.shadow_strictness), cfg=cfg, roi01=None)
+
+    dt = cv2.distanceTransform((m * 255).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+    thin_thr = float(max(7.0, float(cfg.global_halo_peel_dt_frac) * float(min(h, w))))
+    thin = (dt <= thin_thr).astype(np.uint8)
+    edge_support = cv2.dilate(sig.edges01.astype(np.uint8), _k(3), iterations=1)
+    bad = (
+        (boundary > 0)
+        & (thin > 0)
+        & (reach_bg > 0)
+        & (((bg_like > 0) | (shadow > 0)))
+        & (edge_support == 0)
+    )
+    bad_ratio = float(np.sum(bad)) / float(boundary.sum() + 1e-6)
+    if bad_ratio < float(cfg.global_halo_peel_trigger_ratio):
+        return m
+
+    allow = (m & (1 - bad.astype(np.uint8))).astype(np.uint8)
+    recon = _geodesic_reconstruct(core, allow, max_iters=160)
+    recon = _select_component_centered(recon)
+    rm_frac = float(max(0.0, float(m.sum()) - float(recon.sum()))) / float(m.sum() + 1e-6)
+    if rm_frac <= 0.0:
+        return m
+    if rm_frac > float(cfg.global_halo_peel_max_remove_frac):
+        return m
+
+    if runtime is not None:
+        runtime["halo_peel"] = {
+            "bad_ratio": float(bad_ratio),
+            "removed_px": float(max(0.0, float(m.sum()) - float(recon.sum()))),
+            "removed_frac": float(rm_frac),
+        }
+    return recon.astype(np.uint8)
+
+
+def _tip_restore(
+    mask01: np.ndarray,
+    sig: _SegSignals,
+    cfg: SegmentationConfig,
+    runtime: dict[str, object] | None = None,
+) -> np.ndarray:
+    m = (mask01 > 0).astype(np.uint8)
+    if m.sum() < 500 or not bool(cfg.tip_restore_enabled):
+        return m
+
+    h, w = m.shape[:2]
+    border_vals = sig.d_bg_u8[sig.border_mask01 > 0]
+    if border_vals.size < 80:
+        return m
+    fg_thr = float(np.percentile(border_vals, 99.0) + 8.0)
+    fg_thr = float(max(15.0, min(240.0, fg_thr)))
+    reach_bg = _reachable_background_mask(sig, strictness=float(cfg.shadow_strictness), cfg=cfg, roi01=None)
+
+    ring = (cv2.dilate(m, _k(3), iterations=1) > 0) & (m == 0)
+    edge = cv2.dilate(sig.edges01.astype(np.uint8), _k(3), iterations=1) > 0
+    fg_like = sig.d_bg_u8.astype(np.float32) >= float(fg_thr)
+    add = ring & edge & fg_like & (reach_bg == 0)
+    add_px = int(np.sum(add))
+    if add_px <= 0:
+        return m
+
+    max_add = float(cfg.tip_restore_max_add_frac) * float(m.sum() + 1e-6)
+    if float(add_px) > max_add:
+        return m
+
+    out = m.copy()
+    out[add] = 1
+    out = _select_component_centered(out.astype(np.uint8))
+    if runtime is not None:
+        runtime["tip_restore"] = {
+            "added_px": float(add_px),
+            "added_frac": float(float(add_px) / float(m.sum() + 1e-6)),
+        }
+    return out.astype(np.uint8)
+
+
 def _largest_component(mask01: np.ndarray) -> np.ndarray:
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask01.astype(np.uint8), connectivity=8)
     if num <= 1:
@@ -447,6 +631,176 @@ def _largest_component(mask01: np.ndarray) -> np.ndarray:
     areas = stats[1:, cv2.CC_STAT_AREA]
     best_idx = 1 + int(np.argmax(areas))
     return (labels == best_idx).astype(np.uint8)
+
+
+def _edge_based_finger_refine(
+    bgr: np.ndarray,
+    mask01: np.ndarray,
+    sig: "_SegSignals",
+    cfg: SegmentationConfig,
+    runtime: dict[str, object] | None = None,
+) -> np.ndarray:
+    """
+    Edge-based finger separation and tip recovery.
+
+    Phase 1 – Gap carving (inter-finger fix):
+        Compute convex hull gap. Identify mask pixels that lie in the
+        gap's boundary band, are thin (low distance transform), and are
+        background-like or have low contrast with local background.
+        Carve them out to separate fingers.
+
+    Phase 2 – Tip recovery (leather/latex fix):
+        Find strong edges just outside mask boundary → grow mask outward
+        to include edge-supported, non-background pixels.
+    """
+    m = (mask01 > 0).astype(np.uint8)
+    h, w = m.shape[:2]
+    area0 = int(m.sum())
+    if area0 < 500:
+        return m
+
+    # Tip protection: never let this stage carve away a fingertip band that was
+    # already present. This is especially important for fabric, where gap carving
+    # can cascade once tips are slightly clipped upstream.
+    tip_keep = np.zeros_like(m, dtype=np.uint8)
+    if bool(getattr(cfg, "tip_protect_enabled", True)):
+        frac = float(getattr(cfg, "tip_protect_frac", 0.18))
+        kd = float(getattr(cfg, "tip_protect_dilate_frac", 0.006))
+        tip_keep = _tip_keep_mask_upright(bgr, m, frac=frac, dilate_frac=kd)
+        tip_keep = (tip_keep & m).astype(np.uint8)
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    profile = str(cfg.profile_name).lower()
+    carved_px = 0
+    grown_px = 0
+    m_in = m.copy()
+    top_in = None
+    if profile == "fabric":
+        ys = np.where(m_in > 0)[0]
+        top_in = int(ys.min()) if ys.size else None
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Phase 1: Inter-finger gap carve (fabric only).
+    #  Strategy: pixels in [mask AND hull-gap-region AND thin-boundary
+    #  AND (bg-like OR shadow-like OR edge-near)] get carved out.
+    #  Only runs for fabric — leather/latex don't have this problem
+    #  and the criteria over-carves their finger boundary shadows.
+    # ──────────────────────────────────────────────────────────────────
+    if profile == "fabric":
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            cnt = max(cnts, key=cv2.contourArea)
+            hull = cv2.convexHull(cnt)
+            hull_mask = np.zeros((h, w), np.uint8)
+            cv2.drawContours(hull_mask, [hull], -1, 1, -1)
+            gap = ((hull_mask > 0) & (m == 0)).astype(np.uint8)
+            gap_frac = float(gap.sum()) / float(area0 + 1e-6)
+
+            if gap_frac > 0.02:
+                # Dilate the gap to identify the "gap influence zone" — mask
+                # pixels immediately adjacent to detectable inter-finger gaps.
+                gap_dil_k = max(7, int(round(min(h, w) * 0.018)))
+                gap_zone = cv2.dilate(gap, _k(gap_dil_k), iterations=1)
+                gap_zone = ((gap_zone > 0) & (m > 0)).astype(np.uint8)
+
+                # Distance transform: only carve thin (boundary-like) pixels.
+                dt = cv2.distanceTransform((m * 255).astype(np.uint8), cv2.DIST_L2, 5)
+                thin_thr = max(6.0, min(h, w) * 0.018)
+                thin = (dt <= thin_thr).astype(np.uint8)
+
+                # Background-like check (relaxed for shadow regions).
+                border_vals = sig.d_bg_u8[sig.border_mask01 > 0]
+                if border_vals.size >= 80:
+                    bg_thr = float(np.percentile(border_vals, float(cfg.bg_like_percentile)))
+                    bg_thr = float(bg_thr + float(cfg.bg_like_margin) * 1.5)
+                else:
+                    bg_thr = float(_bg_like_thr_u8(sig)) * 1.3
+                bg_like = (sig.d_bg_u8.astype(np.float32) <= bg_thr).astype(np.uint8)
+
+                # Shadow-like check: low saturation pixels in inter-finger
+                # areas tend to be desaturated shadows.
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                low_sat = (hsv[:, :, 1] < 35).astype(np.uint8)
+
+                # Carve: gap_zone AND thin AND (bg-like OR low-saturation).
+                carve = (
+                    (gap_zone > 0)
+                    & (thin > 0)
+                    & ((bg_like > 0) | (low_sat > 0))
+                ).astype(np.uint8)
+
+                # Edge-boost: also carve thin gap-zone pixels near edges
+                # (finger outlines).
+                edges = cv2.Canny(gray, 50, 150)
+                edge_zone = cv2.dilate(edges, _k(3), iterations=1)
+                carve_edge = (
+                    (gap_zone > 0) & (thin > 0) & (edge_zone > 0)
+                ).astype(np.uint8)
+                carve = ((carve > 0) | (carve_edge > 0)).astype(np.uint8)
+                if int(tip_keep.sum()) > 0:
+                    carve = (carve & (1 - tip_keep)).astype(np.uint8)
+
+                rm_frac = float(carve.sum()) / float(area0 + 1e-6)
+                if 0.001 < rm_frac < 0.10:
+                    m[carve > 0] = 0
+                    m = _select_component_centered(m)
+                    # Safety: if this carve trims fingertips (common failure mode),
+                    # revert the carve rather than cascading into tip loss.
+                    if top_in is not None:
+                        ys2 = np.where(m > 0)[0]
+                        top_after = int(ys2.min()) if ys2.size else None
+                        if top_after is None:
+                            m = m_in.copy()
+                        else:
+                            thr = max(8, int(round(0.020 * float(h))))
+                            if int(top_after - top_in) > thr:
+                                m = m_in.copy()
+                    carved_px = int(carve.sum()) if int((m != m_in).any()) else 0
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Phase 2: Tip recovery — grow mask outward where edges confirm
+    #  glove boundary (rescues clipped fingertips).
+    #  Skip for fabric: Phase 2 would grow INTO gaps, making it worse.
+    # ──────────────────────────────────────────────────────────────────
+    if profile != "fabric":
+        grow_k = max(5, int(round(min(h, w) * 0.025)))
+        outer_ring = cv2.dilate(m, _k(grow_k), iterations=1)
+        outer_ring = ((outer_ring > 0) & (m == 0)).astype(np.uint8)
+
+        edges_strong = cv2.Canny(gray, 60, 160)
+        edge_support = cv2.dilate(edges_strong, _k(3), iterations=1)
+
+        border_vals = sig.d_bg_u8[sig.border_mask01 > 0]
+        if border_vals.size >= 80:
+            bg_thr = float(np.percentile(border_vals, float(cfg.bg_like_percentile)))
+            bg_thr = float(bg_thr + float(cfg.bg_like_margin))
+        else:
+            bg_thr = float(_bg_like_thr_u8(sig))
+        not_bg = (sig.d_bg_u8.astype(np.float32) > bg_thr).astype(np.uint8)
+
+        grow_pixels = (
+            (outer_ring > 0)
+            & (edge_support > 0)
+            & (not_bg > 0)
+        ).astype(np.uint8)
+
+        grow_area = int(grow_pixels.sum())
+        max_grow = max(200, int(area0 * 0.04))
+        if 0 < grow_area <= max_grow:
+            m = ((m > 0) | (grow_pixels > 0)).astype(np.uint8)
+            m = _select_component_centered(m)
+            grown_px = grow_area
+
+    if runtime is not None:
+        runtime["edge_finger_refine"] = {
+            "gap_carved_px": carved_px,
+            "tip_grown_px": grown_px,
+        }
+
+    if int(tip_keep.sum()) > 0:
+        m = ((m > 0) | (tip_keep > 0)).astype(np.uint8)
+        m = _select_component_centered(m)
+    return m
 
 
 def _fill_holes(mask01: np.ndarray) -> np.ndarray:
@@ -538,23 +892,64 @@ def _disconnect_border_leaks(mask01: np.ndarray) -> np.ndarray:
     return out
 
 
-def _prune_boundary_color_outliers(bgr: np.ndarray, mask01: np.ndarray) -> np.ndarray:
+def _prune_boundary_color_outliers(
+    bgr: np.ndarray,
+    mask01: np.ndarray,
+    *,
+    cfg: SegmentationConfig | None = None,
+    sig: _SegSignals | None = None,
+    stats: dict[str, float | bool | str] | None = None,
+) -> np.ndarray:
     """
     Remove likely background leakage on the boundary by checking LAB color
     consistency against an eroded interior region.
     """
     m = (mask01 > 0).astype(np.uint8)
+    if stats is not None:
+        stats.clear()
+        stats.update(
+            {
+                "applied": False,
+                "reverted": False,
+                "reason": "none",
+                "area_before": float(m.sum()),
+                "area_after": float(m.sum()),
+                "border_touch_before": float(_border_touch_ratio(m)),
+                "border_touch_after": float(_border_touch_ratio(m)),
+            }
+        )
     if m.sum() < 100:
+        if stats is not None:
+            stats["reason"] = "small_mask"
+        return m
+    if cfg is not None and not bool(cfg.boundary_prune_enabled):
+        if stats is not None:
+            stats["reason"] = "disabled"
+        return m
+
+    bt0 = float(_border_touch_ratio(m))
+    if (
+        cfg is not None
+        and bool(cfg.boundary_prune_skip_if_low_leak)
+        and str(cfg.profile_name).lower() == "latex"
+        and bt0 <= 0.03
+    ):
+        if stats is not None:
+            stats["reason"] = "low_leak_latex_skip"
         return m
 
     h, w = m.shape[:2]
     erode_sz = max(3, int(round(min(h, w) * 0.012)))
     core = cv2.erode(m, _k(erode_sz), iterations=1)
     if core.sum() < 80:
+        if stats is not None:
+            stats["reason"] = "small_core"
         return m
 
     boundary = (m - core).astype(np.uint8)
     if boundary.sum() < 20:
+        if stats is not None:
+            stats["reason"] = "small_boundary"
         return m
 
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -562,6 +957,8 @@ def _prune_boundary_color_outliers(bgr: np.ndarray, mask01: np.ndarray) -> np.nd
     de = np.linalg.norm(lab - med.reshape(1, 1, 3), axis=2)
     core_de = de[core > 0]
     if core_de.size == 0:
+        if stats is not None:
+            stats["reason"] = "core_stats_empty"
         return m
     thr = float(np.percentile(core_de, 93) + 5.0)
     thr = max(8.0, min(42.0, thr))
@@ -574,6 +971,14 @@ def _prune_boundary_color_outliers(bgr: np.ndarray, mask01: np.ndarray) -> np.nd
     ab_thr = max(4.0, min(26.0, ab_thr))
 
     keep_boundary = ((boundary > 0) & (de <= thr) & (ab_dist <= ab_thr)).astype(np.uint8)
+    if cfg is None or bool(cfg.boundary_prune_edge_rescue):
+        if sig is not None:
+            edge01 = (sig.edges01 > 0).astype(np.uint8)
+        else:
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            edge01 = (_auto_canny(gray, sigma=0.33) > 0).astype(np.uint8)
+        edge_band = cv2.dilate(edge01, _k(max(3, erode_sz | 1)), iterations=1)
+        keep_boundary = (keep_boundary | (((boundary > 0) & (edge_band > 0)).astype(np.uint8))).astype(np.uint8)
     core_l = lab[:, :, 0][core > 0]
     if core_l.size and float(np.mean(core_l)) > 115.0:
         l_lo = float(np.percentile(core_l, 5) - 18.0)
@@ -582,6 +987,25 @@ def _prune_boundary_color_outliers(bgr: np.ndarray, mask01: np.ndarray) -> np.nd
     out = (core | keep_boundary).astype(np.uint8)
     out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, _k(max(5, erode_sz + 2)), iterations=1)
     out = _largest_component(out)
+    bt1 = float(_border_touch_ratio(out))
+    area0 = float(m.sum())
+    area1 = float(out.sum())
+    removed_frac = float(max(0.0, area0 - area1)) / float(area0 + 1e-6)
+    leak_improve = float(bt0 - bt1)
+    # If pruning removed too much area without meaningful leakage improvement, revert.
+    if removed_frac > 0.06 and leak_improve < 0.010:
+        if stats is not None:
+            stats["applied"] = True
+            stats["reverted"] = True
+            stats["reason"] = "revert_large_drop_low_gain"
+            stats["area_after"] = float(area0)
+            stats["border_touch_after"] = float(bt0)
+        return m
+    if stats is not None:
+        stats["applied"] = True
+        stats["reason"] = "ok"
+        stats["area_after"] = float(area1)
+        stats["border_touch_after"] = float(bt1)
     return out
 
 
@@ -611,6 +1035,185 @@ def _select_component_centered(mask01: np.ndarray) -> np.ndarray:
     if best_idx < 1:
         return _largest_component(m)
     return (labels == best_idx).astype(np.uint8)
+
+
+def _mask_area_frac(mask01: np.ndarray) -> float:
+    h, w = mask01.shape[:2]
+    return float(np.sum(mask01 > 0)) / float((h * w) + 1e-6)
+
+
+def _shape_plausibility(mask01: np.ndarray) -> tuple[float, dict[str, float | int]]:
+    """
+    Lightweight glove-likeness score used only as a *tie-breaker*.
+
+    The goal is to prefer glove-like silhouettes over generic blobs when multiple
+    candidates have similar evidence/edge/color scores.
+    """
+    m = (mask01 > 0).astype(np.uint8)
+    h, w = m.shape[:2]
+    if int(m.sum()) < 120:
+        return 0.0, {"shape_solidity": 0.0, "shape_defects": 0, "shape_score": 0.0}
+
+    cnts, _hier = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return 0.0, {"shape_solidity": 0.0, "shape_defects": 0, "shape_score": 0.0}
+    cnt = max(cnts, key=cv2.contourArea)
+    area = float(cv2.contourArea(cnt))
+    if area <= 1.0:
+        return 0.0, {"shape_solidity": 0.0, "shape_defects": 0, "shape_score": 0.0}
+
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull))
+    solidity = float(area / float(hull_area + 1e-6))
+
+    # Convexity defects (finger valleys) are a weak glove cue, but folded gloves
+    # can have zero defects, so keep this influence small.
+    defects_count = 0
+    try:
+        hull_idx = cv2.convexHull(cnt, returnPoints=False)
+        if hull_idx is not None and len(hull_idx) >= 4 and len(cnt) >= 4:
+            defects = cv2.convexityDefects(cnt, hull_idx)
+            if defects is not None and len(defects) > 0:
+                depth_px = defects[:, 0, 3].astype(np.float32) / 256.0
+                thr = float(max(2.0, 0.020 * float(min(h, w))))
+                defects_count = int(np.sum(depth_px >= thr))
+    except Exception:
+        defects_count = 0
+
+    # Prefer moderately non-convex shapes (typical gloves) over near-rectangular blobs.
+    sol_score = float(np.clip(1.0 - abs(solidity - 0.88) / 0.20, 0.0, 1.0))
+    def_score = float(np.clip(float(defects_count) / 4.0, 0.0, 1.0))
+    shape_score = float((0.65 * sol_score) + (0.35 * def_score))
+    return shape_score, {"shape_solidity": float(solidity), "shape_defects": int(defects_count), "shape_score": float(shape_score)}
+
+
+def _mask_iou(a01: np.ndarray, b01: np.ndarray) -> float:
+    a = (a01 > 0).astype(np.uint8)
+    b = (b01 > 0).astype(np.uint8)
+    inter = float(np.sum((a > 0) & (b > 0)))
+    union = float(np.sum((a > 0) | (b > 0)))
+    return float(inter / (union + 1e-6))
+
+
+def _tip_band_mask(mask01: np.ndarray, *, frac: float) -> np.ndarray:
+    """
+    Return a 0/1 mask selecting the likely fingertip-end band of the silhouette.
+
+    Uses PCA along the major axis, then chooses the narrower end (cuff is typically
+    wider than finger tips). This is used as a *soft keep* region so refinement
+    passes don't trim tips that were already present in a candidate.
+    """
+    m = (mask01 > 0).astype(np.uint8)
+    if int(m.sum()) < 200:
+        return np.zeros_like(m, dtype=np.uint8)
+
+    ys, xs = np.where(m > 0)
+    if xs.size < 200:
+        return np.zeros_like(m, dtype=np.uint8)
+
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    mean = pts.mean(axis=0)
+    pts0 = pts - mean
+    cov = (pts0.T @ pts0) / float(max(1, pts0.shape[0]))
+    try:
+        vals, vecs = np.linalg.eigh(cov)
+    except Exception:
+        return np.zeros_like(m, dtype=np.uint8)
+
+    v = vecs[:, int(np.argmax(vals))].astype(np.float32)
+    nv = float(np.linalg.norm(v)) + 1e-6
+    v = v / nv
+    u = np.array([-v[1], v[0]], dtype=np.float32)
+
+    proj = (pts0 @ v).astype(np.float32)
+    ortho = (pts0 @ u).astype(np.float32)
+    pmin = float(np.min(proj))
+    pmax = float(np.max(proj))
+    rng = float(pmax - pmin)
+    if not np.isfinite(rng) or rng < 1e-3:
+        return np.zeros_like(m, dtype=np.uint8)
+
+    f = float(max(0.06, min(0.35, frac)))
+    end_band = float(max(0.10, min(0.22, 0.12 if f <= 0.18 else (0.10 + 0.6 * f))))
+    sel_low = proj <= float(pmin + end_band * rng)
+    sel_high = proj >= float(pmax - end_band * rng)
+    if int(np.sum(sel_low)) < 30 or int(np.sum(sel_high)) < 30:
+        # Fallback: pick an arbitrary end.
+        tip_is_high = True
+    else:
+        # Narrower end is more likely to be fingertips than the cuff.
+        w_low = float(np.percentile(np.abs(ortho[sel_low]), 95) - np.percentile(np.abs(ortho[sel_low]), 5))
+        w_high = float(np.percentile(np.abs(ortho[sel_high]), 95) - np.percentile(np.abs(ortho[sel_high]), 5))
+        tip_is_high = bool(w_high <= w_low)
+
+    if tip_is_high:
+        keep = proj >= float(pmax - f * rng)
+    else:
+        keep = proj <= float(pmin + f * rng)
+
+    tip = np.zeros_like(m, dtype=np.uint8)
+    tip[ys[keep], xs[keep]] = 1
+    return tip.astype(np.uint8)
+
+
+def _tip_keep_mask_upright(
+    bgr: np.ndarray,
+    mask01: np.ndarray,
+    *,
+    frac: float,
+    dilate_frac: float,
+) -> np.ndarray:
+    """
+    Tip keep-mask derived in an upright-normalized frame (fingers on top).
+
+    This is more robust than guessing which PCA-end is the fingertips in the
+    original frame. Output is in the original image coordinates (0/1 uint8).
+    """
+    m0 = (mask01 > 0).astype(np.uint8)
+    h0, w0 = m0.shape[:2]
+    if int(m0.sum()) < 200:
+        return np.zeros_like(m0, dtype=np.uint8)
+
+    rot_bgr, rot_m01, mat = _upright_normalize(bgr, m0)
+    x, y, ww, hh = cv2.boundingRect(rot_m01.astype(np.uint8))
+    if ww <= 0 or hh <= 0:
+        return np.zeros_like(m0, dtype=np.uint8)
+
+    f = float(max(0.06, min(0.35, frac)))
+    band_h = int(max(6, round(f * float(hh))))
+    y_end_top = int(min(rot_m01.shape[0], max(0, y + band_h)))
+    y_start_bot = int(max(0, min(rot_m01.shape[0], (y + hh) - band_h)))
+    tip_rot = np.zeros_like(rot_m01, dtype=np.uint8)
+    # Protect both ends. We intentionally don't rely on the fingers-on-top
+    # heuristic here; some glove shapes make that ambiguous.
+    tip_rot[y:y_end_top, x : x + ww] = 1
+    tip_rot[y_start_bot : y + hh, x : x + ww] = 1
+    tip_rot = (tip_rot & rot_m01).astype(np.uint8)
+
+    if int(tip_rot.sum()) > 0:
+        kd = max(3, int(round(float(dilate_frac) * float(min(rot_m01.shape[:2])))))
+        kd = int(min(19, max(3, kd | 1)))
+        tip_rot = cv2.dilate(tip_rot, _k(kd), iterations=1).astype(np.uint8)
+
+    inv = cv2.invertAffineTransform(mat)
+    tip_back = cv2.warpAffine(tip_rot, inv, (w0, h0), flags=cv2.INTER_NEAREST, borderValue=0)
+    tip_back = (tip_back > 0).astype(np.uint8)
+    if int(tip_back.sum()) > 0:
+        kd2 = max(3, int(round(float(dilate_frac) * float(min(h0, w0)))))
+        kd2 = int(min(19, max(3, kd2 | 1)))
+        tip_back = cv2.dilate(tip_back, _k(kd2), iterations=1).astype(np.uint8)
+    return tip_back.astype(np.uint8)
+
+
+def _build_silhouette_ref(cand_lo: np.ndarray, cand_edge: np.ndarray, cand_edge_s: np.ndarray, h: int, w: int) -> np.ndarray:
+    sil = ((cand_lo > 0) | (cand_edge > 0) | (cand_edge_s > 0)).astype(np.uint8)
+    if sil.sum() < int(0.02 * h * w):
+        return sil
+    k = max(5, int(round(min(h, w) * 0.012)))
+    sil = cv2.morphologyEx(sil, cv2.MORPH_OPEN, _k(max(3, k // 2)), iterations=1)
+    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, _k(k), iterations=2)
+    sil = _select_component_centered(_largest_component(sil))
+    return sil.astype(np.uint8)
 
 
 def _auto_canny(img_u8: np.ndarray, sigma: float = 0.33) -> np.ndarray:
@@ -663,7 +1266,13 @@ def _shadow_like_mask_internal(sig: _SegSignals, *, strictness: float, suppress_
     return shadow.astype(np.uint8)
 
 
-def _reachable_background_mask(sig: _SegSignals, *, strictness: float) -> np.ndarray:
+def _reachable_background_mask(
+    sig: _SegSignals,
+    *,
+    strictness: float,
+    cfg: SegmentationConfig | None = None,
+    roi01: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Estimate border-reachable background + shadow region using a chroma-first model.
 
@@ -695,8 +1304,18 @@ def _reachable_background_mask(sig: _SegSignals, *, strictness: float) -> np.nda
     # Allow some L drop for shadow, but keep it bounded to avoid including dark glove pixels.
     # When strictness is lower, allow more shadow.
     l_margin = float(42.0 + (20.0 / strict))
-    l_margin = float(max(36.0, min(86.0, l_margin)))
+    prof = str(cfg.profile_name).lower() if cfg is not None else "balanced"
+    if prof == "leather":
+        l_margin -= 7.0
+    l_margin = float(max(32.0, min(90.0, l_margin)))
     l_ok = l >= float(bg_l - l_margin)
+    # Latex/fabric deep shadows between fingers can be dark but still border-reachable background.
+    # Widen L-margin only in the finger ROI to avoid global over-carving.
+    if prof in {"latex", "fabric"}:
+        roi = np.ones_like(l_ok, dtype=np.uint8) if roi01 is None else (roi01 > 0).astype(np.uint8)
+        l_margin_roi = float(min(104.0, l_margin + 12.0))
+        l_ok_roi = l >= float(bg_l - l_margin_roi)
+        l_ok = np.where(roi > 0, l_ok_roi, l_ok)
 
     cand = ((ab <= thr_ab) & (l_ok > 0)).astype(np.uint8)
 
@@ -740,6 +1359,8 @@ def _convexity_webbing_carve(
     bbox: tuple[int, int, int, int],
     reach_bg01: np.ndarray,
     cfg: SegmentationConfig,
+    *,
+    stats: dict[str, float | str] | None = None,
 ) -> np.ndarray:
     """
     Shape-only carve aimed at removing the thumb-index webbing fill.
@@ -747,9 +1368,22 @@ def _convexity_webbing_carve(
     If the silhouette is overly convex (high solidity), compute convexity defects and
     carve 1-2 deepest defect wedges in the finger ROI.
 
-    Updated: also require the wedge to overlap border-reachable background/shadow evidence.
-    This avoids carving true glove concavities when the webbing space is not actually background-like.
+    Updated:
+    - evidence mode: require overlap with border-reachable background.
+    - geometry mode: depth/ROI-only carve with strict safety caps.
+    - hybrid mode: evidence-first, then geometry fallback if evidence is insufficient.
     """
+    if stats is not None:
+        stats.clear()
+        stats.update(
+            {
+                "mode_requested": str(cfg.gap_carve_mode),
+                "mode_used": "none",
+                "solidity": 0.0,
+                "evidence_removed_px": 0.0,
+                "geometry_removed_px": 0.0,
+            }
+        )
     m = (upright_mask01 > 0).astype(np.uint8)
     if m.sum() < 600:
         return m
@@ -767,11 +1401,29 @@ def _convexity_webbing_carve(
     hull_area = float(cv2.contourArea(hull_pts)) + 1e-6
     solidity = float(area / hull_area)
     strict_solidity = bool(solidity >= float(cfg.webbing_solidity_thr))
+    if stats is not None:
+        stats["solidity"] = float(solidity)
 
     hull_idx = cv2.convexHull(cnt, returnPoints=False)
     if hull_idx is None or len(hull_idx) < 4:
         return m
-    defects = cv2.convexityDefects(cnt, hull_idx)
+    try:
+        defects = cv2.convexityDefects(cnt, hull_idx)
+    except cv2.error:
+        # Rarely, a noisy contour can trigger non-monotonous hull indices.
+        # Smooth/approximate once and retry; if still invalid, skip this carve pass.
+        cnt2 = cv2.approxPolyDP(cnt, epsilon=2.0, closed=True)
+        if cnt2 is None or len(cnt2) < 4:
+            return m
+        hull_idx2 = cv2.convexHull(cnt2, returnPoints=False)
+        if hull_idx2 is None or len(hull_idx2) < 4:
+            return m
+        try:
+            defects = cv2.convexityDefects(cnt2, hull_idx2)
+            cnt = cnt2
+            hull_idx = hull_idx2
+        except cv2.error:
+            return m
     if defects is None:
         return m
 
@@ -818,8 +1470,9 @@ def _convexity_webbing_carve(
 
     # Build wedges and rank by reach_bg overlap (and depth), focusing on thumb side.
     reach_bg = (reach_bg01 > 0).astype(np.uint8)
-    if reach_bg.sum() < 100:
-        return m
+    mode = str(cfg.gap_carve_mode).strip().lower()
+    if mode not in {"evidence", "geometry", "hybrid"}:
+        mode = "hybrid"
 
     def _wedge_overlap(si: int, ei: int, fi: int) -> tuple[np.ndarray, float, float]:
         s = cnt[si][0]
@@ -843,30 +1496,32 @@ def _convexity_webbing_carve(
         side_ok = (fx > cx) if thumb_is_right else (fx < cx)
         if not side_ok:
             continue
-        wedge, ov, denom = _wedge_overlap(si, ei, fi)
-        if ov <= 0.0:
-            continue
-        # Prefer wedges closer to the finger base (webbing), not along the outer silhouette.
+        wedge, ov, _denom = _wedge_overlap(si, ei, fi)
         y_norm = (float(fy) - float(y)) / float(hh + 1e-6)
-        loc_bonus = 1.0 - abs(y_norm - 0.48)  # peak around ~0.48 of bbox height
-        score = float(ov) * float(depth) * float(max(0.55, loc_bonus))
-        cand_scored.append((score, float(ov), depth, si, ei, fi, fx, fy, wedge))
+        loc_bonus = float(max(0.55, 1.0 - abs(y_norm - 0.48)))
+        score_e = float(ov) * float(depth) * float(loc_bonus)
+        score_g = float(depth) * float(loc_bonus)
+        cand_scored.append((score_e, score_g, float(ov), depth, si, ei, fi, fx, fy, wedge))
 
     # Fallback: if thumb-side filter produced nothing, consider all candidates.
     if not cand_scored:
         for depth, si, ei, fi, fx, fy in candidates:
-            wedge, ov, denom = _wedge_overlap(si, ei, fi)
-            if ov <= 0.0:
-                continue
+            wedge, ov, _denom = _wedge_overlap(si, ei, fi)
             y_norm = (float(fy) - float(y)) / float(hh + 1e-6)
-            loc_bonus = 1.0 - abs(y_norm - 0.48)
-            score = float(ov) * float(depth) * float(max(0.55, loc_bonus))
-            cand_scored.append((score, float(ov), depth, si, ei, fi, fx, fy, wedge))
+            loc_bonus = float(max(0.55, 1.0 - abs(y_norm - 0.48)))
+            score_e = float(ov) * float(depth) * float(loc_bonus)
+            score_g = float(depth) * float(loc_bonus)
+            cand_scored.append((score_e, score_g, float(ov), depth, si, ei, fi, fx, fy, wedge))
 
-    cand_scored.sort(reverse=True, key=lambda t: float(t[0]))
+    if not cand_scored:
+        return m
+
+    cand_scored_e = sorted(cand_scored, reverse=True, key=lambda t: float(t[0]))
+    cand_scored_g = sorted(cand_scored, reverse=True, key=lambda t: float(t[1]))
     # If not very convex, only allow a single carve unless evidence is strong.
     max_def = int(max(1, cfg.webbing_max_defects)) if strict_solidity else 1
-    cand_scored = cand_scored[:max_def]
+    cand_scored_e = cand_scored_e[:max_def]
+    cand_scored_g = cand_scored_g[:max_def]
 
     dt = cv2.distanceTransform((m * 255).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
     # Allow carving slightly deeper than a pure boundary band: webbing gaps can be fairly wide.
@@ -875,20 +1530,72 @@ def _convexity_webbing_carve(
     dt_thr = float(min(dt_thr, 0.24 * float(min(ww, hh))))
 
     out = m.copy()
-    for _score, overlap, _depth, si, ei, fi, _fx, _fy, wedge in cand_scored:
-        thr_overlap = float(cfg.webbing_reach_overlap_thr)
-        if not strict_solidity:
-            thr_overlap = float(max(thr_overlap, 0.26))
-        if overlap < thr_overlap:
-            continue
+    evidence_removed = 0
+    if mode in {"evidence", "hybrid"}:
+        if reach_bg.sum() > 100:
+            for _score_e, _score_g, overlap, _depth, _si, _ei, _fi, _fx, _fy, wedge in cand_scored_e:
+                thr_overlap = float(cfg.webbing_reach_overlap_thr)
+                if not strict_solidity:
+                    thr_overlap = float(max(thr_overlap, 0.26))
+                if overlap < thr_overlap:
+                    continue
+                rm = (wedge > 0) & (roi01 > 0) & (reach_bg > 0) & (dt <= dt_thr) & (out > 0)
+                rm_px = int(np.sum(rm))
+                if rm_px < 25:
+                    continue
+                out[rm] = 0
+                evidence_removed += rm_px
+        if evidence_removed > 0:
+            out = _select_component_centered(out.astype(np.uint8))
+    if stats is not None:
+        stats["evidence_removed_px"] = float(evidence_removed)
 
-        rm = (wedge > 0) & (roi01 > 0) & (reach_bg > 0) & (dt <= dt_thr) & (out > 0)
-        if np.sum(rm) < 25:
-            continue
-        out[rm] = 0
+    geometry_removed = 0
+    need_geometry = False
+    if mode == "geometry":
+        need_geometry = True
+    elif mode == "hybrid":
+        rm_frac = float(evidence_removed) / float(m.sum() + 1e-6)
+        need_geometry = bool((rm_frac < 0.002) and (solidity >= float(cfg.gap_geometry_fallback_solidity)))
 
-    out = _select_component_centered(out.astype(np.uint8))
-    return out.astype(np.uint8)
+    if need_geometry:
+        pre = out.copy() if mode == "hybrid" else m.copy()
+        base = pre.copy()
+        bt0 = float(_border_touch_ratio(base))
+        x0, y0, ww0, hh0 = cv2.boundingRect(base.astype(np.uint8))
+        ext0 = float(base.sum()) / float(ww0 * hh0 + 1e-6) if ww0 > 0 and hh0 > 0 else 0.0
+        cap = float(cfg.gap_max_remove_frac) * float(base.sum() + 1e-6)
+        for _score_e, _score_g, _overlap, _depth, _si, _ei, _fi, _fx, _fy, wedge in cand_scored_g:
+            if geometry_removed >= cap:
+                break
+            rm = (wedge > 0) & (roi01 > 0) & (dt <= dt_thr) & (pre > 0)
+            rm_px = int(np.sum(rm))
+            if rm_px < 25:
+                continue
+            if float(geometry_removed + rm_px) > cap:
+                continue
+            pre[rm] = 0
+            geometry_removed += rm_px
+        if geometry_removed > 0:
+            cand = _select_component_centered(pre.astype(np.uint8))
+            bt1 = float(_border_touch_ratio(cand))
+            x1, y1, ww1, hh1 = cv2.boundingRect(cand.astype(np.uint8))
+            ext1 = float(cand.sum()) / float(ww1 * hh1 + 1e-6) if ww1 > 0 and hh1 > 0 else 0.0
+            # Reject if carve degrades outer silhouette behavior.
+            if (bt1 <= bt0 + 0.01) and (ext1 >= ext0 - 0.04):
+                out = cand
+            else:
+                geometry_removed = 0
+
+    if stats is not None:
+        stats["geometry_removed_px"] = float(geometry_removed)
+        if geometry_removed > 0:
+            stats["mode_used"] = "geometry" if mode == "geometry" else "hybrid"
+        elif evidence_removed > 0:
+            stats["mode_used"] = "evidence" if mode == "evidence" else "hybrid"
+        else:
+            stats["mode_used"] = "none"
+    return _select_component_centered(out.astype(np.uint8)).astype(np.uint8)
 
 
 def _compute_signals(bgr: np.ndarray) -> _SegSignals:
@@ -1015,6 +1722,58 @@ def _threshold_segment_lab_l_bidirectional(l_u8: np.ndarray) -> tuple[np.ndarray
     return mask_hi, mask_lo
 
 
+def _chroma_candidate(sig: _SegSignals) -> np.ndarray:
+    """
+    Candidate foreground from LAB chroma, useful when glove luminance is close to white background.
+    """
+    h, w = sig.lab_u8.shape[:2]
+    lab_f = sig.lab_u8.astype(np.float32)
+    ab = lab_f[:, :, 1:3] - 128.0
+    chroma = np.sqrt((ab[:, :, 0] * ab[:, :, 0]) + (ab[:, :, 1] * ab[:, :, 1]))
+
+    border_vals = chroma[sig.border_mask01 > 0]
+    if border_vals.size < 80:
+        return np.zeros((h, w), np.uint8)
+
+    thr = float(np.percentile(border_vals, 99.2) + 2.0)
+    thr = max(thr, float(np.percentile(chroma, 70.0)))
+    fg = ((chroma >= thr) & (sig.center_prior > 0.04)).astype(np.uint8)
+
+    k1 = max(3, int(round(min(h, w) * 0.006)))
+    k2 = max(7, int(round(min(h, w) * 0.015)))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _k(k1), iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, _k(k2), iterations=2)
+    fg = _select_component_centered(fg)
+    return fg.astype(np.uint8)
+
+
+def _texture_candidate(bgr: np.ndarray, sig: _SegSignals) -> np.ndarray:
+    """
+    Candidate foreground from texture energy. Helps on low-chroma fabric against white background.
+    """
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    tex_u8 = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    border_vals = tex_u8[sig.border_mask01 > 0]
+    if border_vals.size < 80:
+        return np.zeros((h, w), np.uint8)
+
+    thr = int(np.percentile(border_vals, 99.2) + 5.0)
+    thr = max(thr, int(np.percentile(tex_u8, 78.0)))
+    thr = int(min(250, max(16, thr)))
+    fg = ((tex_u8 >= thr) & (sig.center_prior > 0.04)).astype(np.uint8)
+
+    k1 = max(3, int(round(min(h, w) * 0.005)))
+    k2 = max(5, int(round(min(h, w) * 0.011)))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _k(k1), iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, _k(k2), iterations=1)
+    fg = _select_component_centered(fg)
+    return fg.astype(np.uint8)
+
+
 def _edge_alignment(mask01: np.ndarray, edges01: np.ndarray) -> float:
     if mask01.sum() < 50:
         return 0.0
@@ -1036,7 +1795,7 @@ def _bg_sep_u8(mask01: np.ndarray, d_bg_u8: np.ndarray, border01: np.ndarray) ->
     return float(np.median(in_vals) - np.median(bd_vals))
 
 
-def _score_mask(bgr: np.ndarray, mask01: np.ndarray, sig: _SegSignals) -> tuple[float, dict]:
+def _score_mask(bgr: np.ndarray, mask01: np.ndarray, sig: _SegSignals, cfg: SegmentationConfig | None = None) -> tuple[float, dict]:
     h, w = mask01.shape[:2]
     area = float(mask01.sum())
     if area <= 0:
@@ -1075,6 +1834,11 @@ def _score_mask(bgr: np.ndarray, mask01: np.ndarray, sig: _SegSignals) -> tuple[
     num_cc, _, stats, _ = cv2.connectedComponentsWithStats(mask01.astype(np.uint8), connectivity=8)
     small = int(np.sum((stats[1:, cv2.CC_STAT_AREA] < 80).astype(np.int32))) if num_cc > 1 else 0
 
+    shape_score = 0.0
+    shape_metrics: dict[str, float | int] = {"shape_solidity": 0.0, "shape_defects": 0, "shape_score": 0.0}
+    if cfg is not None and bool(getattr(cfg, "shape_plausibility_enabled", True)):
+        shape_score, shape_metrics = _shape_plausibility(mask01)
+
     score = 0.0
     score += 2.2 * float(extent)
     score += 1.0 * float(center_w)
@@ -1085,6 +1849,9 @@ def _score_mask(bgr: np.ndarray, mask01: np.ndarray, sig: _SegSignals) -> tuple[
     score -= 0.10 * float(max(0, num_cc - 2))
     score -= 0.06 * float(small)
     score += 0.15 * float(min(1.0, float(frac) / 0.35))
+    if cfg is not None:
+        w_shape = float(getattr(cfg, "shape_plausibility_weight", 0.08))
+        score += float(max(0.0, w_shape)) * float(shape_score)
 
     metrics = {
         "area_frac": float(frac),
@@ -1096,8 +1863,440 @@ def _score_mask(bgr: np.ndarray, mask01: np.ndarray, sig: _SegSignals) -> tuple[
         "shadow_in": float(shadow_in),
         "num_cc": int(num_cc - 1),
         "small_cc": int(small),
+        **{k: (float(v) if isinstance(v, (float, int)) else v) for k, v in shape_metrics.items()},
     }
     return float(score), metrics
+
+
+
+# ── Type-specific candidate generators ──────────────────────────────────
+
+
+def _latex_multiscale_edge_candidate(bgr: np.ndarray, sig: _SegSignals) -> np.ndarray:
+    """
+    Candidate for **latex** gloves (near-white on white background).
+
+    Strategy: white top-hat enhances subtle luminance differences, then
+    multi-scale Canny (σ=1.0, 2.0, 3.5) on both L and ab-gradient channels
+    fuses edges at different scales.  The merged edge map is used as a barrier
+    for flood-fill from the border → invert = foreground candidate.
+    """
+    h, w = bgr.shape[:2]
+    gray = sig.lab_u8[:, :, 0]  # L channel
+
+    # 1. White top-hat to enhance subtle contrast.
+    th_k = max(21, int(round(min(h, w) * 0.06)) | 1)
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_k, th_k)))
+    # Boost so faint features become visible.
+    enhanced = cv2.normalize(
+        cv2.add(gray, tophat), None, 0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    # 2. CLAHE on the enhanced L for more even gradients.
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(enhanced)
+
+    # 3. Multi-scale Canny on L channel.
+    merged_edges = np.zeros((h, w), dtype=np.uint8)
+    for sigma in (1.0, 2.0, 3.5):
+        ks = int(round(sigma * 6)) | 1
+        ks = max(3, ks)
+        blurred = cv2.GaussianBlur(l_clahe, (ks, ks), sigma)
+        edges = _auto_canny(blurred, sigma=0.30)
+        merged_edges = cv2.max(merged_edges, edges)
+
+    # 4. Multi-scale Canny on ab-gradient (shadow-invariant edges).
+    a = cv2.GaussianBlur(sig.lab_u8[:, :, 1], (5, 5), 0)
+    b = cv2.GaussianBlur(sig.lab_u8[:, :, 2], (5, 5), 0)
+    ax = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3)
+    ay = cv2.Sobel(a, cv2.CV_32F, 0, 1, ksize=3)
+    bx = cv2.Sobel(b, cv2.CV_32F, 1, 0, ksize=3)
+    by = cv2.Sobel(b, cv2.CV_32F, 0, 1, ksize=3)
+    mag_ab = cv2.magnitude(ax, ay) + cv2.magnitude(bx, by)
+    mag_ab_u8 = cv2.normalize(mag_ab, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    for sigma in (1.5, 3.0):
+        ks = int(round(sigma * 6)) | 1
+        ks = max(3, ks)
+        blurred_ab = cv2.GaussianBlur(mag_ab_u8, (ks, ks), sigma)
+        edges_ab = _auto_canny(blurred_ab, sigma=0.28)
+        merged_edges = cv2.max(merged_edges, edges_ab)
+
+    # 5. Morphological external gradient as extra edge evidence.
+    ext_grad = cv2.dilate(l_clahe, _k(3), iterations=1).astype(np.int16) - l_clahe.astype(np.int16)
+    ext_grad = np.clip(ext_grad, 0, 255).astype(np.uint8)
+    _, ext_edges = cv2.threshold(ext_grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    merged_edges = cv2.max(merged_edges, ext_edges)
+
+    # 6. Build barrier from edges and flood-fill from border.
+    dil = cv2.dilate(merged_edges, _k(3), iterations=1)
+    kclose = max(9, int(round(min(h, w) * 0.018)))
+    barrier = cv2.morphologyEx(dil, cv2.MORPH_CLOSE, _k(kclose), iterations=1)
+    barrier = cv2.morphologyEx(barrier, cv2.MORPH_CLOSE, _k(max(5, kclose // 2)), iterations=1)
+
+    free = (barrier == 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(free, connectivity=8)
+    if num <= 1:
+        return np.zeros((h, w), np.uint8)
+
+    best_idx, best_score = -1, -1e9
+    for i in range(1, num):
+        x, y, ww, hh, area = stats[i].tolist()
+        if area < int(0.02 * h * w):
+            continue
+        touches = (x <= 0) or (y <= 0) or (x + ww >= w) or (y + hh >= h)
+        if touches:
+            continue
+        comp = (labels == i).astype(np.uint8)
+        cw = float((sig.center_prior * comp.astype(np.float32)).sum()) / float(area + 1e-6)
+        sc = float(area) * (0.7 + 0.9 * cw)
+        if sc > best_score:
+            best_score = sc
+            best_idx = i
+
+    if best_idx < 1:
+        return np.zeros((h, w), np.uint8)
+
+    cand = (labels == best_idx).astype(np.uint8)
+    k_open = max(3, int(round(min(h, w) * 0.006)))
+    k_close = max(7, int(round(min(h, w) * 0.015)))
+    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, _k(k_open), iterations=1)
+    cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
+    cand = _select_component_centered(cand)
+    return cand.astype(np.uint8)
+
+
+def _saturation_candidate(bgr: np.ndarray, sig: _SegSignals) -> np.ndarray:
+    """
+    Candidate for **leather** gloves using HSV saturation thresholding.
+
+    Leather has high saturation (rich brown/tan colors) while the white background
+    and cast shadows both have very low saturation.  Thresholding the S channel
+    with an adaptive percentile-based threshold gives a strong initial mask.
+    """
+    h, w = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]  # saturation channel
+
+    # Border saturation should be low (white background).
+    border_vals = s[sig.border_mask01 > 0]
+    if border_vals.size < 80:
+        return np.zeros((h, w), np.uint8)
+
+    # Threshold: well above the border saturation.
+    bg_s_p95 = float(np.percentile(border_vals, 95))
+    # Also consider global distribution.
+    global_p65 = float(np.percentile(s, 65))
+    thr = max(bg_s_p95 + 15.0, global_p65)
+    thr = int(min(220, max(25, thr)))
+
+    fg = ((s >= thr) & (sig.center_prior > 0.04)).astype(np.uint8)
+
+    k1 = max(3, int(round(min(h, w) * 0.006)))
+    k2 = max(7, int(round(min(h, w) * 0.016)))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _k(k1), iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, _k(k2), iterations=2)
+    fg = _select_component_centered(fg)
+
+    if fg.sum() < int(0.03 * h * w):
+        # Fallback: try a lower threshold.
+        thr2 = int(max(15, bg_s_p95 + 8.0))
+        fg = ((s >= thr2) & (sig.center_prior > 0.06)).astype(np.uint8)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _k(k1), iterations=1)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, _k(k2), iterations=2)
+        fg = _select_component_centered(fg)
+
+    return fg.astype(np.uint8)
+
+
+def _local_variance_candidate(bgr: np.ndarray, sig: _SegSignals) -> np.ndarray:
+    """
+    Candidate for **fabric** gloves using local intensity variance.
+
+    Knit fabric has high local variance (repeating yarn pattern) while smooth
+    white background has near-zero variance.  A sliding window variance map
+    combined with the existing Laplacian texture energy provides a robust
+    foreground mask.
+    """
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Local variance via E[X²] - E[X]².
+    ksize = max(9, int(round(min(h, w) * 0.025)) | 1)
+    mean = cv2.blur(gray, (ksize, ksize))
+    mean_sq = cv2.blur(gray * gray, (ksize, ksize))
+    variance = np.clip(mean_sq - mean * mean, 0, None)
+    var_u8 = cv2.normalize(variance, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Border variance should be low (smooth background).
+    border_vals = var_u8[sig.border_mask01 > 0]
+    if border_vals.size < 80:
+        return np.zeros((h, w), np.uint8)
+
+    bg_var_p95 = float(np.percentile(border_vals, 95))
+    global_p60 = float(np.percentile(var_u8, 60))
+    thr = max(bg_var_p95 + 5.0, global_p60)
+    thr = int(min(250, max(8, thr)))
+
+    fg = ((var_u8 >= thr) & (sig.center_prior > 0.04)).astype(np.uint8)
+
+    # Also combine with Laplacian texture energy for robustness.
+    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    tex_u8 = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    border_tex = tex_u8[sig.border_mask01 > 0]
+    if border_tex.size >= 80:
+        tex_thr = int(np.percentile(border_tex, 95) + 5.0)
+        tex_thr = int(max(12, min(250, tex_thr)))
+        tex_fg = ((tex_u8 >= tex_thr) & (sig.center_prior > 0.04)).astype(np.uint8)
+        # Weighted OR: either strong variance or strong texture.
+        fg = ((fg > 0) | (tex_fg > 0)).astype(np.uint8)
+
+    # More aggressive closing for fuzzy fabric boundaries.
+    k1 = max(3, int(round(min(h, w) * 0.005)))
+    k2 = max(9, int(round(min(h, w) * 0.020)))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _k(k1), iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, _k(k2), iterations=2)
+    fg = _select_component_centered(fg)
+    return fg.astype(np.uint8)
+
+
+def _chan_vese_candidate(
+    bgr: np.ndarray,
+    sig: _SegSignals,
+    seed01: np.ndarray,
+    cfg: SegmentationConfig,
+) -> np.ndarray:
+    """
+    Optional region-based candidate for weak/soft boundaries (latex, fuzzy fabric).
+
+    Uses Chan–Vese-style active contours (morphological variant when available).
+    This is a *candidate generator* only; final selection still uses scoring + GrabCut.
+    """
+    h, w = bgr.shape[:2]
+    max_side = int(max(128, getattr(cfg, "chan_vese_max_side", 512)))
+    iters = int(max(10, getattr(cfg, "chan_vese_iters", 80)))
+    smoothing = int(max(0, getattr(cfg, "chan_vese_smoothing", 2)))
+
+    # Enhance subtle structure (especially latex-on-white) using the same idea as the
+    # latex multiscale edge candidate: top-hat + CLAHE on L.
+    l = sig.lab_u8[:, :, 0]
+    th_k = max(21, int(round(min(h, w) * 0.06)) | 1)
+    tophat = cv2.morphologyEx(
+        l,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_k, th_k)),
+    )
+    enhanced = cv2.normalize(cv2.add(l, tophat), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_u8 = clahe.apply(enhanced)
+
+    # Downscale for runtime stability.
+    sf = float(min(1.0, float(max_side) / float(max(h, w) + 1e-6)))
+    if sf < 0.999:
+        hh = int(max(64, round(h * sf)))
+        ww = int(max(64, round(w * sf)))
+        img_u8_s = cv2.resize(img_u8, (ww, hh), interpolation=cv2.INTER_AREA)
+        seed_s = cv2.resize((seed01 > 0).astype(np.uint8), (ww, hh), interpolation=cv2.INTER_NEAREST)
+    else:
+        img_u8_s = img_u8
+        seed_s = (seed01 > 0).astype(np.uint8)
+
+    # Seed must not be empty; fallback to a centered disk.
+    if int(seed_s.sum()) < int(0.004 * seed_s.size):
+        seed_s = np.zeros_like(seed_s, dtype=np.uint8)
+        r = int(round(0.22 * float(min(seed_s.shape[:2]))))
+        r = int(max(12, r))
+        cv2.circle(seed_s, (seed_s.shape[1] // 2, seed_s.shape[0] // 2), r, 1, -1)
+
+    img_f = (img_u8_s.astype(np.float32) / 255.0).astype(np.float32)
+    init = (seed_s > 0)
+
+    seg01_s: np.ndarray | None = None
+    try:
+        from skimage.segmentation import morphological_chan_vese  # type: ignore
+
+        seg = morphological_chan_vese(
+            img_f,
+            num_iter=int(iters),
+            init_level_set=init,
+            smoothing=int(smoothing),
+        )
+        seg01_s = (seg > 0).astype(np.uint8)
+    except Exception:
+        # Fallback: classic Chan–Vese implementation.
+        try:
+            from skimage.segmentation import chan_vese  # type: ignore
+
+            seg = chan_vese(
+                img_f,
+                mu=0.25,
+                lambda1=1.0,
+                lambda2=1.0,
+                tol=1e-3,
+                max_num_iter=int(iters),
+                dt=0.5,
+                init_level_set=init,
+                extended_output=False,
+            )
+            seg01_s = (seg > 0).astype(np.uint8)
+        except Exception:
+            return np.zeros((h, w), np.uint8)
+
+    # Pick polarity by overlap with the seed.
+    seed01_s = (seed_s > 0).astype(np.uint8)
+    iou_a = _mask_iou(seg01_s, seed01_s)
+    inv = (1 - seg01_s).astype(np.uint8)
+    iou_b = _mask_iou(inv, seed01_s)
+    if iou_b > iou_a + 0.01:
+        seg01_s = inv
+
+    if sf < 0.999:
+        seg01 = cv2.resize(seg01_s, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        seg01 = seg01_s
+
+    # Mild cleanup: keep centered main component and close small gaps.
+    k1 = max(3, int(round(min(h, w) * 0.006)))
+    k2 = max(9, int(round(min(h, w) * 0.018)))
+    seg01 = cv2.morphologyEx(seg01.astype(np.uint8), cv2.MORPH_OPEN, _k(k1), iterations=1)
+    seg01 = cv2.morphologyEx(seg01.astype(np.uint8), cv2.MORPH_CLOSE, _k(k2), iterations=2)
+    seg01 = _select_component_centered(_largest_component(seg01))
+    return seg01.astype(np.uint8)
+
+
+def _prepare_candidates(
+    bgr: np.ndarray,
+    sig: _SegSignals,
+    cfg: SegmentationConfig,
+) -> tuple[dict[str, np.ndarray], np.ndarray, list[tuple[str, np.ndarray, float, dict]], dict[str, dict[str, float | bool]]]:
+    h, w = bgr.shape[:2]
+    cand_bg, _sure_bg = _bg_distance_candidate(sig)
+    cand_km = _kmeans_segment(bgr, k=3)
+    l = sig.lab_u8[:, :, 0]
+    cand_hi, cand_lo = _threshold_segment_lab_l_bidirectional(l)
+    cand_chroma = _chroma_candidate(sig)
+    cand_texture = _texture_candidate(bgr, sig)
+    cand_edge = _edge_closed_candidate(sig)
+    cand_edge_s = _edge_closed_candidate_strong(sig)
+
+    k_open = max(3, int(round(min(h, w) * 0.008)))
+    k_close = max(9, int(round(min(h, w) * 0.022)))
+    cand_hi = cv2.morphologyEx(cand_hi, cv2.MORPH_OPEN, _k(k_open), iterations=1)
+    cand_hi = cv2.morphologyEx(cand_hi, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
+    cand_hi = _select_component_centered(_largest_component(cand_hi))
+    cand_lo = cv2.morphologyEx(cand_lo, cv2.MORPH_OPEN, _k(k_open), iterations=1)
+    cand_lo = cv2.morphologyEx(cand_lo, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
+    cand_lo = _select_component_centered(_largest_component(cand_lo))
+
+    candidates = {
+        "bg_dist": cand_bg,
+        "kmeans": cand_km,
+        "labL_hi": cand_hi,
+        "labL_lo": cand_lo,
+        "chroma_fg": cand_chroma,
+        "texture_fg": cand_texture,
+        "edge_closed": cand_edge,
+        "edge_closed_strong": cand_edge_s,
+    }
+
+    # ── Type-specific candidates (conditionally enabled) ────────────────
+    if bool(cfg.latex_edge_multiscale):
+        candidates["latex_ms_edge"] = _latex_multiscale_edge_candidate(bgr, sig)
+    if bool(cfg.leather_saturation_candidate):
+        candidates["saturation_fg"] = _saturation_candidate(bgr, sig)
+    if bool(cfg.fabric_variance_candidate):
+        candidates["variance_fg"] = _local_variance_candidate(bgr, sig)
+
+    silhouette_ref = _build_silhouette_ref(cand_lo, cand_edge, cand_edge_s, h, w)
+    profile = str(cfg.profile_name).strip().lower()
+
+    # Build boost/suppress dicts from config tuples.
+    boost_map: dict[str, float] = {str(k): float(v) for k, v in cfg.candidate_boost} if cfg.candidate_boost else {}
+    suppress_map: dict[str, float] = {str(k): float(v) for k, v in cfg.candidate_suppress} if cfg.candidate_suppress else {}
+
+    scored: list[tuple[str, np.ndarray, float, dict]] = []
+    validity: dict[str, dict[str, float | bool]] = {}
+    for m, mk in candidates.items():
+        area_frac = _mask_area_frac(mk)
+        iou_sil = _mask_iou(mk, silhouette_ref) if silhouette_ref.sum() > 0 else 0.0
+        valid = True
+        min_area = 0.0
+        min_iou = 0.0
+        if m == "chroma_fg":
+            min_area = float(cfg.chroma_min_area_frac)
+            min_iou = float(cfg.chroma_min_iou_silhouette)
+            if profile == "leather":
+                min_area *= 0.55
+                min_iou *= 0.45
+            if area_frac < min_area or iou_sil < min_iou:
+                valid = False
+        sc, metrics = _score_mask(bgr, mk, sig, cfg=cfg)
+        if sc > -1e8:
+            # Legacy profile-based adjustments (kept for backward compat).
+            if profile in {"latex", "fabric"} and m in {"labL_lo", "edge_closed", "edge_closed_strong"}:
+                sc += 0.04
+            if m == "chroma_fg":
+                if profile == "leather" and valid:
+                    sc += 0.06
+                elif profile in {"latex", "fabric"} and valid:
+                    sc -= 0.03
+            # ── Configurable per-candidate boost/suppress ────────────
+            if m in boost_map:
+                sc += boost_map[m]
+            if m in suppress_map:
+                sc -= suppress_map[m]
+        if not valid:
+            sc = -1e9
+            metrics = {
+                **(metrics if isinstance(metrics, dict) else {}),
+                "reason": "chroma_invalid",
+            }
+        scored.append((m, mk, float(sc), metrics if isinstance(metrics, dict) else {}))
+        validity[m] = {
+            "valid": bool(valid),
+            "area_frac": float(area_frac),
+            "iou_silhouette": float(iou_sil),
+            "min_area_frac": float(min_area),
+            "min_iou_silhouette": float(min_iou),
+        }
+
+    scored.sort(key=lambda x: float(x[2]), reverse=True)
+
+    # ── Optional region-based fallback candidate (Chan–Vese) ─────────────
+    if bool(cfg.chan_vese_enabled) and profile in {"latex", "fabric"} and scored:
+        top_metrics = scored[0][3] if isinstance(scored[0][3], dict) else {}
+        top_bg_sep = float(top_metrics.get("bg_sep_u8", 0.0))
+        top_edge_align = float(top_metrics.get("edge_align", 0.0))
+        low_conf = bool(
+            (top_bg_sep < float(cfg.chan_vese_low_conf_bg_sep))
+            and (top_edge_align < float(cfg.chan_vese_low_conf_edge_align))
+        )
+        run_cv = (not bool(cfg.chan_vese_only_if_low_confidence)) or low_conf
+        if run_cv:
+            seed = silhouette_ref if int(silhouette_ref.sum()) > 0 else scored[0][1]
+            cand_cv = _chan_vese_candidate(bgr, sig, seed, cfg)
+            m = "chan_vese_fg"
+            candidates[m] = cand_cv
+            area_frac = _mask_area_frac(cand_cv)
+            iou_sil = _mask_iou(cand_cv, silhouette_ref) if silhouette_ref.sum() > 0 else 0.0
+            sc, metrics = _score_mask(bgr, cand_cv, sig, cfg=cfg)
+            if sc > -1e8:
+                if m in boost_map:
+                    sc += boost_map[m]
+                if m in suppress_map:
+                    sc -= suppress_map[m]
+            scored.append((m, cand_cv, float(sc), metrics if isinstance(metrics, dict) else {}))
+            validity[m] = {
+                "valid": True,
+                "area_frac": float(area_frac),
+                "iou_silhouette": float(iou_sil),
+                "min_area_frac": 0.0,
+                "min_iou_silhouette": 0.0,
+            }
+            scored.sort(key=lambda x: float(x[2]), reverse=True)
+
+    return candidates, silhouette_ref, scored, validity
 
 
 def _grabcut_refine(
@@ -1106,6 +2305,9 @@ def _grabcut_refine(
     aux_mask01: np.ndarray | None = None,
     sure_bg_mask01: np.ndarray | None = None,
     cfg: SegmentationConfig | None = None,
+    runtime: dict[str, object] | None = None,
+    sig: _SegSignals | None = None,
+    use_trimap: bool = False,
 ) -> np.ndarray:
     """
     Non-interactive GrabCut refinement.
@@ -1120,16 +2322,113 @@ def _grabcut_refine(
 
     union = ((init > 0) | (aux > 0)).astype(np.uint8)
     inter = ((init > 0) & (aux > 0)).astype(np.uint8)
-    if inter.sum() < 0.004 * h * w:
+    inter_min_ratio = float(getattr(cfg, "grabcut_inter_min_ratio", 0.78)) if cfg is not None else 0.78
+    inter_ratio = float(inter.sum()) / float(init.sum() + 1e-6)
+    # If aux misses significant parts of init (commonly fingertip pixels), do not
+    # let the sure-FG core collapse to the intersection.
+    if (inter.sum() < 0.004 * h * w) or (inter_ratio < inter_min_ratio):
         inter = init.copy()
 
-    erode_sz = max(3, int(round(min(h, w) * 0.012)))
-    dilate_sz = max(5, int(round(min(h, w) * 0.02)))
+    # Tip protection: keep fingertip pixels from the initial mask even if GrabCut
+    # peels them off due to low contrast or seeding uncertainty.
+    tip_keep = np.zeros((h, w), dtype=np.uint8)
+    if cfg is None or bool(getattr(cfg, "tip_protect_enabled", True)):
+        frac = float(getattr(cfg, "tip_protect_frac", 0.18)) if cfg is not None else 0.18
+        kd = float(getattr(cfg, "tip_protect_dilate_frac", 0.006)) if cfg is not None else 0.006
+        tip_keep = _tip_keep_mask_upright(bgr, init, frac=frac, dilate_frac=kd)
+        tip_keep = (tip_keep & init).astype(np.uint8)
+
+    # Configurable seeding geometry.
+    erode_frac = float(cfg.grabcut_erode_frac) if cfg is not None else 0.012
+    dilate_frac = float(cfg.grabcut_dilate_frac) if cfg is not None else 0.020
+    sure_bg_frac = float(cfg.grabcut_sure_bg_dilate_frac) if cfg is not None else 0.09
+    erode_sz = max(3, int(round(min(h, w) * erode_frac)))
+    dilate_sz = max(5, int(round(min(h, w) * dilate_frac)))
     sure_fg = cv2.erode(inter, _k(erode_sz), iterations=1)
     prob_fg = cv2.dilate(union, _k(dilate_sz), iterations=1)
-    sure_bg = (1 - cv2.dilate(prob_fg, _k(max(11, int(round(min(h, w) * 0.09)))), iterations=1)).astype(np.uint8)
+    sure_bg = (1 - cv2.dilate(prob_fg, _k(max(11, int(round(min(h, w) * sure_bg_frac)))), iterations=1)).astype(np.uint8)
+
+    # Optional tri-map seeding based on background-distance (multi-level Otsu).
+    # This provides a more principled initialization than pure morphology on the seed mask,
+    # especially for near-white latex on white backgrounds.
+    trimap_stats: dict[str, float | bool | int | str] = {"enabled": bool(use_trimap), "applied": False}
+    tri_low: np.ndarray | None = None
+    tri_high: np.ndarray | None = None
+    tri_seed_fg: np.ndarray | None = None
+    if bool(use_trimap) and (sig is not None):
+        try:
+            d = sig.d_bg.astype(np.float32)
+            border = sig.border_mask01 > 0
+            border_vals = d[border]
+            if border_vals.size >= 80:
+                lo = float(np.percentile(border_vals, 2.0))
+            else:
+                lo = float(np.percentile(d, 2.0))
+            hi = float(np.percentile(d, 99.5))
+            if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi <= lo + 1e-6):
+                d8 = sig.d_bg_u8.copy()
+                trimap_stats["robust_scale"] = False
+            else:
+                d8f = np.clip((d - lo) / (hi - lo), 0.0, 1.0)
+                d8 = (d8f * 255.0).astype(np.uint8)
+                trimap_stats["robust_scale"] = True
+                trimap_stats["scale_lo"] = float(lo)
+                trimap_stats["scale_hi"] = float(hi)
+
+            classes = int(getattr(cfg, "grabcut_trimap_classes", 3)) if cfg is not None else 3
+            classes = int(max(3, min(5, classes)))
+            thr: list[int] = []
+            try:
+                from skimage.filters import threshold_multiotsu  # type: ignore
+
+                thr = [int(x) for x in np.ravel(threshold_multiotsu(d8, classes=classes)).tolist()]
+                thr = sorted(thr)
+            except Exception:
+                thr = []
+
+            if len(thr) >= 2:
+                tri_low = (d8 <= int(thr[0])).astype(np.uint8)
+                tri_high = (d8 > int(thr[-1])).astype(np.uint8)
+
+                # Restrict "high" seed to be near the candidate region to reduce leakage.
+                cap = cv2.dilate(union, _k(max(11, int(round(min(h, w) * 0.06)))), iterations=1)
+                tri_seed_fg = (tri_high & (cap > 0).astype(np.uint8)).astype(np.uint8)
+
+                # Derive a stricter sure-FG from the intersection between an eroded core
+                # and the high tri-map class. Fall back if it becomes too small.
+                sure_fg2 = (sure_fg & tri_seed_fg).astype(np.uint8)
+                if int(sure_fg2.sum()) >= 80:
+                    sure_fg = sure_fg2
+
+                # Expand probable FG slightly using the tri-map "high" region (capped).
+                prob_fg = ((prob_fg > 0) | (tri_seed_fg > 0)).astype(np.uint8)
+                sure_bg = (1 - cv2.dilate(prob_fg, _k(max(11, int(round(min(h, w) * sure_bg_frac)))), iterations=1)).astype(np.uint8)
+
+                trimap_stats["applied"] = True
+                trimap_stats["classes"] = int(classes)
+                trimap_stats["thr0_u8"] = int(thr[0])
+                trimap_stats["thr_last_u8"] = int(thr[-1])
+                trimap_stats["low_frac"] = float(tri_low.sum()) / float(h * w + 1e-6)
+                trimap_stats["high_frac"] = float(tri_high.sum()) / float(h * w + 1e-6)
+                trimap_stats["seed_high_frac"] = float(tri_seed_fg.sum()) / float(h * w + 1e-6)
+            else:
+                trimap_stats["reason"] = "multiotsu_failed"
+        except Exception as e:
+            trimap_stats["reason"] = f"exception:{type(e).__name__}"
+
+    if runtime is not None and bool(use_trimap):
+        runtime["grabcut_trimap"] = dict(trimap_stats)
 
     mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    if tri_low is not None and tri_high is not None:
+        # Seed background/foreground priors, but allow the geometric candidate seeds
+        # below to override (latex can be low-contrast).
+        mask[tri_low > 0] = cv2.GC_BGD
+        if tri_seed_fg is not None:
+            mask[tri_seed_fg > 0] = cv2.GC_PR_FGD
+        else:
+            mask[tri_high > 0] = cv2.GC_PR_FGD
+
     mask[prob_fg > 0] = cv2.GC_PR_FGD
     mask[sure_fg > 0] = cv2.GC_FGD
     mask[sure_bg > 0] = cv2.GC_BGD
@@ -1147,6 +2446,14 @@ def _grabcut_refine(
     fgd_model = np.zeros((1, 65), np.float64)
     cv2.grabCut(bgr, mask, None, bgd_model, fgd_model, 5, mode=cv2.GC_INIT_WITH_MASK)
     out01 = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+
+    # Candidate-based expansion cap: prevents GrabCut from filling areas the
+    # candidate didn't cover (e.g. inter-finger gaps in fabric).
+    cap_frac = float(cfg.grabcut_candidate_cap_frac) if cfg is not None else 0.0
+    if cap_frac > 0.0:
+        cap_k = max(5, int(round(min(h, w) * cap_frac)))
+        cand_cap = cv2.dilate(union, _k(cap_k), iterations=1)
+        out01 = (out01 & cand_cap).astype(np.uint8)
 
     # Only cap expansion when we see evidence of leakage; unconditional caps can trim fine edges.
     cap_thr = float(cfg.grabcut_cap_border_touch) if cfg is not None else 0.10
@@ -1167,13 +2474,21 @@ def _grabcut_refine(
     out01 = _select_component_centered(out01)
     # Boundary color pruning can be overly conservative on white backgrounds (e.g., latex highlights).
     # Apply it only when we see mild leakage risk.
+    prune_stats: dict[str, float | bool | str] = {}
     if _border_touch_ratio(out01) > 0.03:
-        out01 = _prune_boundary_color_outliers(bgr, out01)
+        out01 = _prune_boundary_color_outliers(bgr, out01, cfg=cfg, stats=prune_stats)
+    if runtime is not None and prune_stats:
+        lst = runtime.setdefault("prune_stats", [])
+        if isinstance(lst, list):
+            lst.append({"stage": "grabcut", **prune_stats})
     bt = _border_touch_ratio(out01)
     if bt > 0.11:
         trimmed = _disconnect_border_leaks(out01)
         if _border_touch_ratio(trimmed) + 0.02 < bt:
             out01 = trimmed
+    if int(tip_keep.sum()) > 0:
+        out01 = ((out01 > 0) | (tip_keep > 0)).astype(np.uint8)
+        out01 = _select_component_centered(out01)
     return out01
 
 
@@ -1182,6 +2497,8 @@ def _recover_trimmed_edges(
     mask01: np.ndarray,
     sig: _SegSignals,
     roi01: np.ndarray | None = None,
+    cfg: SegmentationConfig | None = None,
+    runtime: dict[str, object] | None = None,
     *,
     kd_scale: float = 1.0,
     ring_scale: float = 1.0,
@@ -1209,7 +2526,12 @@ def _recover_trimmed_edges(
     cand = (m | (cand & roi)).astype(np.uint8)
     cand = _select_component_centered(cand)
     if _border_touch_ratio(cand) <= max(0.12, _border_touch_ratio(m) + 0.04):
-        cand2 = _prune_boundary_color_outliers(bgr, cand)
+        prune_stats: dict[str, float | bool | str] = {}
+        cand2 = _prune_boundary_color_outliers(bgr, cand, cfg=cfg, sig=sig, stats=prune_stats)
+        if runtime is not None and prune_stats:
+            lst = runtime.setdefault("prune_stats", [])
+            if isinstance(lst, list):
+                lst.append({"stage": "edge_recover", **prune_stats})
         cand2 = _select_component_centered(cand2)
         if cand2.sum() > m.sum() and cand2.sum() <= int(area0 * min(1.18, float(max_area_mul))):
             m = cand2
@@ -1412,7 +2734,13 @@ def _edge_closed_candidate_strong(sig: _SegSignals) -> np.ndarray:
     return cand.astype(np.uint8)
 
 
-def _watershed_refine(bgr: np.ndarray, init_mask01: np.ndarray, sig: _SegSignals) -> np.ndarray:
+def _watershed_refine(
+    bgr: np.ndarray,
+    init_mask01: np.ndarray,
+    sig: _SegSignals,
+    cfg: SegmentationConfig | None = None,
+    runtime: dict[str, object] | None = None,
+) -> np.ndarray:
     h, w = init_mask01.shape[:2]
     init = (init_mask01 > 0).astype(np.uint8)
     if init.sum() < int(0.01 * h * w):
@@ -1440,8 +2768,13 @@ def _watershed_refine(bgr: np.ndarray, init_mask01: np.ndarray, sig: _SegSignals
     out01 = cv2.morphologyEx(out01, cv2.MORPH_OPEN, _k(5), iterations=1)
     out01 = cv2.morphologyEx(out01, cv2.MORPH_CLOSE, _k(7), iterations=1)
     out01 = _select_component_centered(out01)
+    prune_stats: dict[str, float | bool | str] = {}
     if _border_touch_ratio(out01) > 0.03:
-        out01 = _prune_boundary_color_outliers(bgr, out01)
+        out01 = _prune_boundary_color_outliers(bgr, out01, cfg=cfg, sig=sig, stats=prune_stats)
+    if runtime is not None and prune_stats:
+        lst = runtime.setdefault("prune_stats", [])
+        if isinstance(lst, list):
+            lst.append({"stage": "watershed", **prune_stats})
     bt = _border_touch_ratio(out01)
     if bt > 0.11:
         trimmed = _disconnect_border_leaks(out01)
@@ -1450,7 +2783,12 @@ def _watershed_refine(bgr: np.ndarray, init_mask01: np.ndarray, sig: _SegSignals
     return out01.astype(np.uint8)
 
 
-def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: SegmentationConfig) -> np.ndarray:
+def _upright_finger_refine(
+    bgr: np.ndarray,
+    mask01: np.ndarray,
+    cfg: SegmentationConfig,
+    runtime: dict[str, object] | None = None,
+) -> np.ndarray:
     """
     Rotate the glove upright (PCA) and apply stronger edge recovery only over the
     finger region (top part of the upright glove), then rotate back.
@@ -1470,6 +2808,24 @@ def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: Segmentatio
         back = cv2.warpAffine(rot_m01, inv, (m0.shape[1], m0.shape[0]), flags=cv2.INTER_NEAREST, borderValue=0)
         return _select_component_centered((back > 0).astype(np.uint8))
 
+    # Tip protection in the upright frame: keep a fingertip-end band from the
+    # incoming mask to avoid accidental tip trimming by valley/webbing carving.
+    tip_keep = np.zeros_like(rot_m01, dtype=np.uint8)
+    if bool(getattr(cfg, "tip_protect_enabled", True)):
+        xT, yT, wwT, hhT = cv2.boundingRect(rot_m01.astype(np.uint8))
+        if wwT > 0 and hhT > 0:
+            f = float(max(0.06, min(0.35, float(getattr(cfg, "tip_protect_frac", 0.18)))))
+            band_h = int(max(6, round(f * float(hhT))))
+            y_end_top = int(min(rot_m01.shape[0], max(0, yT + band_h)))
+            y_start_bot = int(max(0, min(rot_m01.shape[0], (yT + hhT) - band_h)))
+            tip_keep[yT:y_end_top, xT : xT + wwT] = 1
+            tip_keep[y_start_bot : yT + hhT, xT : xT + wwT] = 1
+            tip_keep = (tip_keep & (rot_m01 > 0).astype(np.uint8)).astype(np.uint8)
+            if int(tip_keep.sum()) > 0:
+                kd = max(3, int(round(float(getattr(cfg, "tip_protect_dilate_frac", 0.006)) * float(min(rot_m01.shape[:2])))))
+                kd = int(min(19, max(3, kd | 1)))
+                tip_keep = cv2.dilate(tip_keep, _k(kd), iterations=1).astype(np.uint8)
+
     sig = _compute_signals(rot_bgr)
     shadow_any = _shadow_like_mask_anywhere(sig, strictness=float(cfg.shadow_strictness))
     refined = _recover_trimmed_edges(
@@ -1477,6 +2833,8 @@ def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: Segmentatio
         rot_m01,
         sig,
         roi01=roi,
+        cfg=cfg,
+        runtime=runtime,
         kd_scale=float(cfg.upright_kd_scale),
         ring_scale=float(cfg.upright_ring_scale),
         max_area_mul=float(cfg.upright_max_area_mul),
@@ -1571,6 +2929,8 @@ def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: Segmentatio
                 & (thin > 0)
                 & ((sig.d_bg_u8.astype(np.float32) <= float(bg_like_thr)) | (shadow_any > 0))
             )
+            if int(tip_keep.sum()) > 0:
+                rm = rm & (tip_keep == 0)
             refined[rm] = 0
             refined = _select_component_centered(refined)
 
@@ -1580,6 +2940,8 @@ def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: Segmentatio
                 refined,
                 sig,
                 roi01=roi,
+                cfg=cfg,
+                runtime=runtime,
                 kd_scale=1.35,
                 ring_scale=1.15,
                 max_area_mul=1.22,
@@ -1588,10 +2950,13 @@ def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: Segmentatio
     # Shape-only carve for thumb-index webbing (works even when colors/shadows are ambiguous).
     if bool(cfg.webbing_convexity_enabled):
         # Border-reachable background evidence in the upright frame.
-        reach_bg = _reachable_background_mask(sig, strictness=float(cfg.shadow_strictness))
+        reach_bg = _reachable_background_mask(sig, strictness=float(cfg.shadow_strictness), cfg=cfg, roi01=roi)
         reach_edge = _edge_reachable_map(sig, strength=float(cfg.reach_carve_strength))
         reach_bg = ((reach_bg > 0) | (reach_edge > 0)).astype(np.uint8)
-        refined2 = _convexity_webbing_carve(refined, roi, (x, y, ww, hh), reach_bg, cfg)
+        carve_stats: dict[str, float | str] = {}
+        refined2 = _convexity_webbing_carve(refined, roi, (x, y, ww, hh), reach_bg, cfg, stats=carve_stats)
+        if runtime is not None and carve_stats:
+            runtime["carve_stats"] = carve_stats
         if refined2.sum() > 0:
             refined = refined2
 
@@ -1621,13 +2986,21 @@ def _upright_finger_refine(bgr: np.ndarray, mask01: np.ndarray, cfg: Segmentatio
     # Final gap/shadow carve based on edge-reachable background.
     refined = _edge_reachable_bg_carve(refined, sig, roi01=roi, cfg=cfg)
 
+    if int(tip_keep.sum()) > 0:
+        refined = ((refined > 0) | (tip_keep > 0)).astype(np.uint8)
+        refined = _select_component_centered(refined)
+
     inv = cv2.invertAffineTransform(mat)
     back = cv2.warpAffine(refined, inv, (m0.shape[1], m0.shape[0]), flags=cv2.INTER_NEAREST, borderValue=0)
     back = _select_component_centered((back > 0).astype(np.uint8))
     return back.astype(np.uint8)
 
 
-def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> SegmentationResult:
+def segment_glove(
+    bgr: np.ndarray,
+    cfg: SegmentationConfig | None = None,
+    debug_out: dict[str, object] | None = None,
+) -> SegmentationResult:
     """
     Produce a glove mask robust to moderate lighting/background changes.
 
@@ -1636,58 +3009,47 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
     - glove_mask_filled: same mask with internal holes filled (useful for shape features)
     """
     cfg = SegmentationConfig() if cfg is None else cfg
+    runtime: dict[str, object] = {} if debug_out is None else debug_out
+    runtime.clear()
+    runtime["prune_stats"] = []
+    runtime["carve_stats"] = {}
     h, w = bgr.shape[:2]
     sig = _compute_signals(bgr)
-    cand_bg, sure_bg = _bg_distance_candidate(sig)
-    cand_km = _kmeans_segment(bgr, k=3)
-    l = sig.lab_u8[:, :, 0]
-    cand_hi, cand_lo = _threshold_segment_lab_l_bidirectional(l)
-    cand_edge = _edge_closed_candidate(sig)
-    cand_edge_s = _edge_closed_candidate_strong(sig)
+    _, sure_bg = _bg_distance_candidate(sig)
+    _candidates, _silhouette_ref, scored_base, candidate_validity = _prepare_candidates(bgr, sig, cfg)
+    runtime["candidate_validity"] = candidate_validity
+    runtime["candidate_area_frac"] = {k: float(v.get("area_frac", 0.0)) for k, v in candidate_validity.items()}
+    runtime["candidate_iou_silhouette"] = {k: float(v.get("iou_silhouette", 0.0)) for k, v in candidate_validity.items()}
 
     # Always include a centered rectangle prior as last resort.
     rect = np.zeros((h, w), dtype=np.uint8)
     margin = int(round(min(h, w) * 0.08))
     rect[margin:-margin, margin:-margin] = 1
 
-    # Candidate cleanup for L-otsu masks.
-    k_open = max(3, int(round(min(h, w) * 0.008)))
-    k_close = max(9, int(round(min(h, w) * 0.022)))
-    cand_hi = cv2.morphologyEx(cand_hi, cv2.MORPH_OPEN, _k(k_open), iterations=1)
-    cand_hi = cv2.morphologyEx(cand_hi, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
-    cand_hi = _select_component_centered(_largest_component(cand_hi))
-    cand_lo = cv2.morphologyEx(cand_lo, cv2.MORPH_OPEN, _k(k_open), iterations=1)
-    cand_lo = cv2.morphologyEx(cand_lo, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
-    cand_lo = _select_component_centered(_largest_component(cand_lo))
-
-    base = [
-        ("bg_dist", cand_bg),
-        ("kmeans", cand_km),
-        ("labL_hi", cand_hi),
-        ("labL_lo", cand_lo),
-        ("edge_closed", cand_edge),
-        ("edge_closed_strong", cand_edge_s),
-    ]
-    scored_base = []
-    for m, mk in base:
-        sc, metrics = _score_mask(bgr, mk, sig)
-        scored_base.append((m, mk, sc, metrics))
-    scored_base.sort(key=lambda x: float(x[2]), reverse=True)
-
     best_method, best_init, best_score, best_metrics = scored_base[0]
-    aux_init = scored_base[1][1] if len(scored_base) > 1 else best_init
+
+    def _best_aux(exclude_method: str) -> np.ndarray:
+        for m, mk, sc, _mt in scored_base:
+            if m != exclude_method and float(sc) > -1e8:
+                return mk
+        for m, mk, _sc, _mt in scored_base:
+            if m != exclude_method:
+                return mk
+        return best_init
+
+    aux_init = _best_aux(best_method)
     if cfg.force_candidate in {m for (m, _mk, _sc, _mt) in scored_base}:
         for m, mk, sc, mt in scored_base:
             if m == cfg.force_candidate:
                 best_method, best_init, best_score, best_metrics = m, mk, sc, mt
-                aux_init = best_init
+                aux_init = _best_aux(best_method)
                 break
 
     # Use centered rectangle only as last resort; don't let it outscore real candidates.
     if float(best_score) < -1e8:
         best_method = "rect"
         best_init = rect
-        aux_init = rect
+        aux_init = _best_aux(best_method) if len(scored_base) > 1 else rect
 
     # Adaptive refinement: prefer GrabCut when we have enough evidence; else use watershed.
     bg_sep = float(best_metrics.get("bg_sep_u8", 0.0)) if isinstance(best_metrics, dict) else 0.0
@@ -1698,6 +3060,16 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
     elif cfg.force_refine == "watershed":
         use_grabcut = False
 
+    def _want_trimap(bg_sep_u8: float, edge_align_v: float) -> bool:
+        if not bool(getattr(cfg, "grabcut_trimap_enabled", False)):
+            return False
+        if not bool(getattr(cfg, "grabcut_trimap_only_if_low_confidence", True)):
+            return True
+        return bool(
+            (float(bg_sep_u8) < float(getattr(cfg, "grabcut_trimap_low_conf_bg_sep", 22.0)))
+            and (float(edge_align_v) < float(getattr(cfg, "grabcut_trimap_low_conf_edge_align", 0.10)))
+        )
+
     # Shadow suppression: treat shadow-like pixels around the seed as sure background
     # to prevent GrabCut/Watershed expansion into soft shadows.
     shadow01 = _shadow_like_mask(sig, strictness=float(cfg.shadow_strictness))
@@ -1706,12 +3078,39 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
     seed_ring = (seed_ring & (1 - seed_union)).astype(np.uint8)
     sure_bg2 = (sure_bg | (shadow01 & seed_ring)).astype(np.uint8)
 
+    # Global tip keep-mask derived from the *selected candidate*.
+    # This is applied late (after aggressive carving stages) to prevent fingertip loss
+    # cascading through later refinements.
+    tip_keep_global = np.zeros((h, w), dtype=np.uint8)
+    if bool(getattr(cfg, "tip_protect_enabled", True)) and best_method != "rect":
+        tip_keep_global = _tip_keep_mask_upright(
+            bgr,
+            (best_init > 0).astype(np.uint8),
+            frac=float(getattr(cfg, "tip_protect_frac", 0.18)),
+            dilate_frac=float(getattr(cfg, "tip_protect_dilate_frac", 0.006)),
+        )
+        tip_keep_global = (tip_keep_global & (best_init > 0).astype(np.uint8)).astype(np.uint8)
+        if runtime is not None:
+            runtime["tip_keep_global_px"] = float(tip_keep_global.sum())
+
     refined01 = None
+    used_refine = "grabcut" if use_grabcut else "watershed"
     if use_grabcut:
-        refined01 = _grabcut_refine(bgr, best_init, aux_mask01=aux_init, sure_bg_mask01=sure_bg2, cfg=cfg)
+        use_trimap = _want_trimap(bg_sep, edge_align)
+        runtime["grabcut_trimap_use"] = bool(use_trimap)
+        refined01 = _grabcut_refine(
+            bgr,
+            best_init,
+            aux_mask01=aux_init,
+            sure_bg_mask01=sure_bg2,
+            cfg=cfg,
+            runtime=runtime,
+            sig=sig,
+            use_trimap=bool(use_trimap),
+        )
     else:
         # Add shadow-like ring pixels as background markers by forcing them out post-hoc.
-        refined01 = _watershed_refine(bgr, best_init, sig)
+        refined01 = _watershed_refine(bgr, best_init, sig, cfg=cfg, runtime=runtime)
         refined01 = (refined01 & (1 - (shadow01 & seed_ring))).astype(np.uint8)
 
     # Final sanity: if the top choice is unreasonable, fall back to the next candidate.
@@ -1737,10 +3136,24 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
                 use_gc2 = True
             elif cfg.force_refine == "watershed":
                 use_gc2 = False
-            cand2 = _grabcut_refine(bgr, mk2, aux_mask01=best_init, sure_bg_mask01=sure_bg2, cfg=cfg) if use_gc2 else _watershed_refine(bgr, mk2, sig)
+            cand2 = (
+                _grabcut_refine(
+                    bgr,
+                    mk2,
+                    aux_mask01=best_init,
+                    sure_bg_mask01=sure_bg2,
+                    cfg=cfg,
+                    runtime=runtime,
+                    sig=sig,
+                    use_trimap=bool(_want_trimap(bg_sep2, edge_align2)),
+                )
+                if use_gc2
+                else _watershed_refine(bgr, mk2, sig, cfg=cfg, runtime=runtime)
+            )
             if _is_reasonable(cand2):
                 best_method = m2
                 refined01 = cand2
+                used_refine = "grabcut" if use_gc2 else "watershed"
                 break
 
     # Recover slightly trimmed edges (especially for fabric/latex) in a controlled manner.
@@ -1749,6 +3162,8 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
             bgr,
             refined01,
             sig,
+            cfg=cfg,
+            runtime=runtime,
             kd_scale=float(cfg.edge_recover_kd_scale),
             ring_scale=float(cfg.edge_recover_ring_scale),
             max_area_mul=float(cfg.edge_recover_max_area_mul),
@@ -1757,10 +3172,10 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
     # Optional glove-aware pass: rotate upright, recover fingertip edges, rotate back.
     # Keep only if it objectively improves the mask score under the same signals.
     used_upright = False
-    sc0, _m0 = _score_mask(bgr, refined01, sig)
-    upright = _upright_finger_refine(bgr, refined01, cfg) if cfg.upright_enabled else None
+    sc0, _m0 = _score_mask(bgr, refined01, sig, cfg=cfg)
+    upright = _upright_finger_refine(bgr, refined01, cfg, runtime=runtime) if cfg.upright_enabled else None
     if upright is not None and upright.sum() > 0 and cfg.upright_enabled:
-        sc1, _m1 = _score_mask(bgr, upright, sig)
+        sc1, _m1 = _score_mask(bgr, upright, sig, cfg=cfg)
         # Add a glove-aware penalty: background-like pixels inside the finger ROI indicate filled valleys/webbing.
         rot_bgr0, rot_m0, _ = _upright_normalize(bgr, refined01)
         sig0 = _compute_signals(rot_bgr0)
@@ -1777,9 +3192,48 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
         better_global = float(sc1) > float(sc0) + float(cfg.upright_min_improve_score)
         better_gap = float(bg_like1) + float(cfg.upright_min_improve_bg_like) < float(bg_like0)
         safe = _border_touch_ratio(upright) <= max(0.12, _border_touch_ratio(refined01) + 0.03)
-        if safe and (better_global or better_gap):
+        tip_retain_ok = True
+        tip_retain = 1.0
+        if bool(getattr(cfg, "tip_protect_enabled", True)):
+            # Compute retention in the upright-normalized frame to avoid ambiguity
+            # about which end is the fingertips in the original orientation.
+            xT, yT, wwT, hhT = cv2.boundingRect(rot_m0.astype(np.uint8))
+            if wwT > 0 and hhT > 0:
+                f = float(max(0.06, min(0.35, float(getattr(cfg, "tip_protect_frac", 0.18)))))
+                band_h = int(max(6, round(f * float(hhT))))
+                y_end_top = int(min(rot_m0.shape[0], max(0, yT + band_h)))
+                y_start_bot = int(max(0, min(rot_m0.shape[0], (yT + hhT) - band_h)))
+                tip_u = np.zeros_like(rot_m0, dtype=np.uint8)
+                tip_u[yT:y_end_top, xT : xT + wwT] = 1
+                tip_u[y_start_bot : yT + hhT, xT : xT + wwT] = 1
+                tip_u = (tip_u & (rot_m0 > 0).astype(np.uint8)).astype(np.uint8)
+                denom = float(tip_u.sum())
+                if denom >= 120.0:
+                    tip_retain = float(((rot_m1 > 0) & (tip_u > 0)).sum()) / float(denom + 1e-6)
+                    tip_retain_ok = bool(tip_retain >= float(getattr(cfg, "upright_min_tip_retain", 0.92)))
+        if runtime is not None:
+            runtime["upright_tip_retain"] = float(tip_retain)
+            runtime["upright_tip_retain_ok"] = bool(tip_retain_ok)
+
+        if safe and tip_retain_ok and (better_global or better_gap):
             refined01 = upright
             used_upright = True
+
+    # Global post-cleanups in original orientation:
+    # - peel border-reachable background halo leaks,
+    # - then restore tiny clipped fingertips (primarily leather).
+    refined01 = _global_boundary_halo_peel(refined01, sig, cfg, runtime=runtime)
+    refined01 = _tip_restore(refined01, sig, cfg, runtime=runtime)
+
+    # ── Edge-based finger refinement ──────────────────────────────────
+    # Uses Canny edges as barriers to carve inter-finger gaps (fabric) and
+    # recover clipped fingertips (leather/latex).
+    if bool(cfg.edge_finger_separation_enabled):
+        refined01 = _edge_based_finger_refine(bgr, refined01, sig, cfg, runtime=runtime)
+
+    if int(tip_keep_global.sum()) > 0:
+        refined01 = ((refined01 > 0) | (tip_keep_global > 0)).astype(np.uint8)
+        refined01 = _select_component_centered(refined01)
 
     # Seal small gaps so interior holes (true defects) remain enclosed and detectable.
     refined01 = cv2.morphologyEx(refined01, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
@@ -1788,7 +3242,7 @@ def segment_glove(bgr: np.ndarray, cfg: SegmentationConfig | None = None) -> Seg
     return SegmentationResult(
         glove_mask=(refined01 * 255).astype(np.uint8),
         glove_mask_filled=(filled01 * 255).astype(np.uint8),
-        method=f"{best_method}+{'grabcut' if use_grabcut else 'watershed'}" + ("+upright_fingers" if used_upright else ""),
+        method=f"{best_method}+{used_refine}" + ("+upright_fingers" if used_upright else ""),
     )
 
 
@@ -1798,38 +3252,52 @@ def segment_glove_debug(bgr: np.ndarray, cfg: SegmentationConfig | None = None) 
     """
     cfg = SegmentationConfig() if cfg is None else cfg
     sig = _compute_signals(bgr)
-    fg_bg, sure_bg = _bg_distance_candidate(sig)
-    km = _kmeans_segment(bgr, k=3)
-    l = sig.lab_u8[:, :, 0]
-    hi, lo = _threshold_segment_lab_l_bidirectional(l)
-    edge = _edge_closed_candidate(sig)
-    edge_s = _edge_closed_candidate_strong(sig)
-
-    h, w = bgr.shape[:2]
-    k_open = max(3, int(round(min(h, w) * 0.008)))
-    k_close = max(9, int(round(min(h, w) * 0.022)))
-    hi = cv2.morphologyEx(hi, cv2.MORPH_OPEN, _k(k_open), iterations=1)
-    hi = cv2.morphologyEx(hi, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
-    hi = _select_component_centered(_largest_component(hi))
-    lo = cv2.morphologyEx(lo, cv2.MORPH_OPEN, _k(k_open), iterations=1)
-    lo = cv2.morphologyEx(lo, cv2.MORPH_CLOSE, _k(k_close), iterations=2)
-    lo = _select_component_centered(_largest_component(lo))
-
-    candidates = {
-        "bg_dist": fg_bg,
-        "kmeans": km,
-        "labL_hi": hi,
-        "labL_lo": lo,
-        "edge_closed": edge,
-        "edge_closed_strong": edge_s,
-    }
+    candidates, silhouette_ref, scored_base, candidate_validity = _prepare_candidates(bgr, sig, cfg)
+    candidates = {**candidates, "silhouette_ref": silhouette_ref}
     scored = []
-    for m, mk in candidates.items():
-        sc, metrics = _score_mask(bgr, mk, sig)
-        scored.append({"method": m, "score": float(sc), **(metrics if isinstance(metrics, dict) else {})})
+    for m, _mk, sc, metrics in scored_base:
+        valid = candidate_validity.get(m, {})
+        scored.append(
+            {
+                "method": m,
+                "score": float(sc),
+                "candidate_valid": bool(valid.get("valid", True)),
+                "candidate_area_frac": float(valid.get("area_frac", 0.0)),
+                "candidate_iou_silhouette": float(valid.get("iou_silhouette", 0.0)),
+                **(metrics if isinstance(metrics, dict) else {}),
+            }
+        )
     scored.sort(key=lambda d: float(d.get("score", -1e9)), reverse=True)
 
-    res = segment_glove(bgr, cfg=cfg)
+    runtime: dict[str, object] = {}
+    res = segment_glove(bgr, cfg=cfg, debug_out=runtime)
+    prune_summary: dict[str, float | bool | str] = {"applied": False, "reverted": False, "reason": "none"}
+    prune_rows = runtime.get("prune_stats")
+    if isinstance(prune_rows, list) and prune_rows:
+        last = prune_rows[-1]
+        if isinstance(last, dict):
+            prune_summary = {k: v for k, v in last.items() if isinstance(v, (float, int, bool, str))}
+    carve_summary: dict[str, float | str] = {"mode_used": "none", "evidence_removed_px": 0.0, "geometry_removed_px": 0.0}
+    carve_row = runtime.get("carve_stats")
+    if isinstance(carve_row, dict):
+        carve_summary = {k: v for k, v in carve_row.items() if isinstance(v, (float, int, str))}
+    halo_row = runtime.get("halo_peel")
+    if isinstance(halo_row, dict):
+        for k, v in halo_row.items():
+            if isinstance(v, (float, int, str)):
+                carve_summary[f"halo_{k}"] = v
+    tip_row = runtime.get("tip_restore")
+    if isinstance(tip_row, dict):
+        for k, v in tip_row.items():
+            if isinstance(v, (float, int, str)):
+                carve_summary[f"tip_{k}"] = v
+
+    trimap_use = bool(runtime.get("grabcut_trimap_use", False))
+    trimap_stats: dict[str, float | int | bool | str] = {}
+    trow = runtime.get("grabcut_trimap")
+    if isinstance(trow, dict):
+        trimap_stats = {k: v for k, v in trow.items() if isinstance(v, (float, int, bool, str))}
+
     dbg = SegmentationDebug(
         bg_is_white=bool(sig.bg_is_white),
         bg_is_uniform=bool(sig.bg_is_uniform),
@@ -1840,6 +3308,11 @@ def segment_glove_debug(bgr: np.ndarray, cfg: SegmentationConfig | None = None) 
         edges_u8=sig.edges_u8.copy(),
         candidates={k: v.copy() for k, v in candidates.items()},
         scored=scored,
+        candidate_validity={k: dict(v) for k, v in candidate_validity.items()},
+        carve_stats=carve_summary,
+        prune_stats=prune_summary,
+        grabcut_trimap_use=bool(trimap_use),
+        grabcut_trimap=dict(trimap_stats),
         chosen_method=str(res.method),
     )
     return res, dbg

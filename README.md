@@ -83,6 +83,8 @@ cd "/Users/ayaanminhas/Desktop/IPPR Assignment"
 In `app/streamlit_app.py`:
 - structural min score default: `0.65`
 - surface/color min score default: `0.85`
+- segmentation mode default: `Auto (type-conditional)` (probe glove type, try top profile(s), pick best mask quality)
+- segmentation debug default: `ON`
 - defect dropdown supports either:
   - `All` (run all defects)
   - a single selected defect (run only that defect)

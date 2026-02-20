@@ -18,19 +18,34 @@ class GloveTypeModel:
     encoder: LabelEncoder
     clf: object
 
-    def predict(self, features: np.ndarray) -> tuple[str, float]:
-        # Guard against stale models after feature engineering changes.
-        n_in = getattr(self.clf, "n_features_in_", None)
-        if n_in is not None and int(n_in) != int(features.reshape(1, -1).shape[1]):
-            raise ValueError(f"Feature length mismatch: model expects {int(n_in)}, got {int(features.size)}")
-
+    def _validate_feature_length(self, features: np.ndarray) -> np.ndarray:
         x = features.reshape(1, -1)
+        n_in = getattr(self.clf, "n_features_in_", None)
+        if n_in is not None and int(n_in) != int(x.shape[1]):
+            raise ValueError(f"Feature length mismatch: model expects {int(n_in)}, got {int(features.size)}")
+        return x
+
+    def predict(self, features: np.ndarray) -> tuple[str, float]:
+        x = self._validate_feature_length(features)
         if hasattr(self.clf, "predict_proba"):
             probs = self.clf.predict_proba(x)[0]
             idx = int(np.argmax(probs))
             return str(self.encoder.inverse_transform([idx])[0]), float(probs[idx])
         pred = self.clf.predict(x)[0]
         return str(self.encoder.inverse_transform([int(pred)])[0]), 0.5
+
+    def predict_proba(self, features: np.ndarray) -> dict[str, float]:
+        x = self._validate_feature_length(features)
+        if hasattr(self.clf, "predict_proba"):
+            probs = np.asarray(self.clf.predict_proba(x)[0], dtype=np.float32)
+            out: dict[str, float] = {}
+            for idx, prob in enumerate(probs.tolist()):
+                label = str(self.encoder.inverse_transform([int(idx)])[0])
+                out[label] = float(prob)
+            return out
+
+        label, score = self.predict(features)
+        return {str(label): float(score)}
 
 
 def train_glove_type_model(x: np.ndarray, y: list[str], model_type: str = "logreg") -> GloveTypeModel:

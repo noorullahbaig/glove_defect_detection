@@ -83,6 +83,15 @@ def _apply_seg_preset(preset: str) -> None:
                 "seg_webbing_overlap": 0.18,
                 "seg_reach_carve_on": True,
                 "seg_reach_carve_strength": 1.0,
+                "seg_profile_name": "balanced",
+                "seg_gap_mode": "hybrid",
+                "seg_chroma_min_area": 0.20,
+                "seg_chroma_min_iou": 0.25,
+                "seg_boundary_prune_on": True,
+                "seg_boundary_prune_edge_rescue": True,
+                "seg_boundary_prune_skip_low_leak": True,
+                "seg_gap_geom_solidity": 0.90,
+                "seg_gap_max_rm": 0.06,
             }
         )
     elif preset == "Preserve Edges":
@@ -116,6 +125,15 @@ def _apply_seg_preset(preset: str) -> None:
                 "seg_webbing_overlap": 0.18,
                 "seg_reach_carve_on": True,
                 "seg_reach_carve_strength": 0.7,
+                "seg_profile_name": "balanced",
+                "seg_gap_mode": "hybrid",
+                "seg_chroma_min_area": 0.20,
+                "seg_chroma_min_iou": 0.25,
+                "seg_boundary_prune_on": True,
+                "seg_boundary_prune_edge_rescue": True,
+                "seg_boundary_prune_skip_low_leak": True,
+                "seg_gap_geom_solidity": 0.90,
+                "seg_gap_max_rm": 0.05,
             }
         )
     elif preset == "Strict Gaps":
@@ -149,6 +167,15 @@ def _apply_seg_preset(preset: str) -> None:
                 "seg_webbing_overlap": 0.15,
                 "seg_reach_carve_on": True,
                 "seg_reach_carve_strength": 1.6,
+                "seg_profile_name": "balanced",
+                "seg_gap_mode": "hybrid",
+                "seg_chroma_min_area": 0.20,
+                "seg_chroma_min_iou": 0.25,
+                "seg_boundary_prune_on": True,
+                "seg_boundary_prune_edge_rescue": True,
+                "seg_boundary_prune_skip_low_leak": True,
+                "seg_gap_geom_solidity": 0.88,
+                "seg_gap_max_rm": 0.08,
             }
         )
 
@@ -165,6 +192,10 @@ def _seg_cfg_from_sidebar(enabled: bool) -> SegmentationConfig | None:
     return SegmentationConfig(
         force_candidate=force_candidate,
         force_refine=force_refine,
+        profile_name=str(st.session_state.get("seg_profile_name", "balanced")),
+        gap_carve_mode=str(st.session_state.get("seg_gap_mode", "hybrid")),
+        chroma_min_area_frac=float(st.session_state.get("seg_chroma_min_area", 0.20)),
+        chroma_min_iou_silhouette=float(st.session_state.get("seg_chroma_min_iou", 0.25)),
         grabcut_cap_border_touch=float(st.session_state.get("seg_cap_bt", 0.10)),
         grabcut_open_k=int(st.session_state.get("seg_open_k", 3)),
         grabcut_close_k=int(st.session_state.get("seg_close_k", 7)),
@@ -196,6 +227,27 @@ def _seg_cfg_from_sidebar(enabled: bool) -> SegmentationConfig | None:
         webbing_reach_overlap_thr=float(st.session_state.get("seg_webbing_overlap", 0.18)),
         reach_carve_enabled=bool(st.session_state.get("seg_reach_carve_on", True)),
         reach_carve_strength=float(st.session_state.get("seg_reach_carve_strength", 1.0)),
+        boundary_prune_enabled=bool(st.session_state.get("seg_boundary_prune_on", True)),
+        boundary_prune_edge_rescue=bool(st.session_state.get("seg_boundary_prune_edge_rescue", True)),
+        boundary_prune_skip_if_low_leak=bool(st.session_state.get("seg_boundary_prune_skip_low_leak", True)),
+        gap_geometry_fallback_solidity=float(st.session_state.get("seg_gap_geom_solidity", 0.90)),
+        gap_max_remove_frac=float(st.session_state.get("seg_gap_max_rm", 0.06)),
+        # Type-specific strategy flags.
+        latex_edge_multiscale=bool(st.session_state.get("seg_latex_edge_ms", False)),
+        leather_saturation_candidate=bool(st.session_state.get("seg_leather_sat", False)),
+        fabric_variance_candidate=bool(st.session_state.get("seg_fabric_var", False)),
+        grabcut_trimap_enabled=bool(st.session_state.get("seg_gc_trimap", False)),
+        grabcut_trimap_only_if_low_confidence=bool(st.session_state.get("seg_gc_trimap_lowconf", True)),
+        chan_vese_enabled=bool(st.session_state.get("seg_chan_vese", False)),
+        chan_vese_only_if_low_confidence=bool(st.session_state.get("seg_chan_vese_lowconf", True)),
+        chan_vese_iters=int(st.session_state.get("seg_chan_vese_iters", 80)),
+        chan_vese_max_side=int(st.session_state.get("seg_chan_vese_side", 512)),
+        shape_plausibility_enabled=bool(st.session_state.get("seg_shape_plaus", True)),
+        shape_plausibility_weight=float(st.session_state.get("seg_shape_weight", 0.08)),
+        # Edge-based finger separation + GrabCut seeding (always enabled).
+        edge_finger_separation_enabled=True,
+        grabcut_erode_frac=float(st.session_state.get("seg_gc_erode_frac", 0.008)),
+        grabcut_dilate_frac=float(st.session_state.get("seg_gc_dilate_frac", 0.030)),
     )
 
 
@@ -210,10 +262,11 @@ def main() -> None:
         min_struct_score = st.slider("Min score (structural)", min_value=0.0, max_value=1.0, value=0.65, step=0.01)
         min_surface_score = st.slider("Min score (surface)", min_value=0.0, max_value=1.0, value=0.85, step=0.01)
         max_boxes = st.slider("Max boxes to draw", min_value=1, max_value=100, value=30, step=1)
-        show_seg_debug = st.checkbox("Show segmentation debug", value=False)
+        show_seg_debug = st.checkbox("Show segmentation debug", value=True)
 
         st.subheader("Segmentation Tuning")
-        seg_tuning = st.checkbox("Enable segmentation sliders", value=False)
+        seg_mode = st.selectbox("Segmentation mode", options=["Auto (type-conditional)", "Manual (sliders)"], index=0)
+        seg_tuning = bool(seg_mode == "Manual (sliders)")
         preset = st.selectbox("Preset", options=["Balanced", "Preserve Edges", "Strict Gaps"], index=0, disabled=not seg_tuning)
         cpa, cpb = st.columns(2)
         with cpa:
@@ -226,7 +279,7 @@ def main() -> None:
         with st.expander("Advanced segmentation sliders", expanded=False):
             st.selectbox(
                 "Force candidate",
-                options=["auto", "bg_dist", "labL_hi", "labL_lo", "kmeans", "edge_closed", "edge_closed_strong"],
+                options=["auto", "bg_dist", "labL_hi", "labL_lo", "chroma_fg", "texture_fg", "kmeans", "edge_closed", "edge_closed_strong"],
                 key="seg_force_candidate",
                 disabled=not seg_tuning,
             )
@@ -236,9 +289,39 @@ def main() -> None:
                 key="seg_force_refine",
                 disabled=not seg_tuning,
             )
+            st.selectbox(
+                "Manual profile hint",
+                options=["balanced", "latex", "leather", "fabric"],
+                key="seg_profile_name",
+                disabled=not seg_tuning,
+            )
+            st.selectbox(
+                "Gap carve mode",
+                options=["hybrid", "evidence", "geometry"],
+                key="seg_gap_mode",
+                disabled=not seg_tuning,
+            )
+            st.slider("Chroma min area frac", min_value=0.05, max_value=0.45, value=0.20, step=0.01, key="seg_chroma_min_area", disabled=not seg_tuning)
+            st.slider("Chroma min IoU silhouette", min_value=0.05, max_value=0.60, value=0.25, step=0.01, key="seg_chroma_min_iou", disabled=not seg_tuning)
             st.slider("GrabCut cap border-touch", min_value=0.02, max_value=0.30, value=0.10, step=0.01, key="seg_cap_bt", disabled=not seg_tuning)
             st.slider("GrabCut opening kernel (px)", min_value=1, max_value=11, value=3, step=1, key="seg_open_k", disabled=not seg_tuning)
             st.slider("GrabCut closing kernel (px)", min_value=1, max_value=15, value=7, step=1, key="seg_close_k", disabled=not seg_tuning)
+            st.markdown("**GrabCut tri-map seeding**")
+            st.checkbox("Enable tri-map (multi-level Otsu)", value=False, key="seg_gc_trimap", disabled=not seg_tuning)
+            st.checkbox("Tri-map only if low confidence", value=True, key="seg_gc_trimap_lowconf", disabled=not seg_tuning)
+
+            st.markdown("**Region-based fallback (Chan–Vese)**")
+            st.checkbox("Enable Chan–Vese candidate", value=False, key="seg_chan_vese", disabled=not seg_tuning)
+            st.checkbox("Chan–Vese only if low confidence", value=True, key="seg_chan_vese_lowconf", disabled=not seg_tuning)
+            st.slider("Chan–Vese iters", min_value=10, max_value=200, value=80, step=10, key="seg_chan_vese_iters", disabled=not seg_tuning)
+            st.slider("Chan–Vese max side", min_value=160, max_value=900, value=512, step=32, key="seg_chan_vese_side", disabled=not seg_tuning)
+
+            st.markdown("**Wrong-object guard (shape plausibility)**")
+            st.checkbox("Enable shape plausibility", value=True, key="seg_shape_plaus", disabled=not seg_tuning)
+            st.slider("Shape weight", min_value=0.0, max_value=0.25, value=0.08, step=0.01, key="seg_shape_weight", disabled=not seg_tuning)
+            st.checkbox("Boundary prune enabled", value=True, key="seg_boundary_prune_on", disabled=not seg_tuning)
+            st.checkbox("Boundary prune edge rescue", value=True, key="seg_boundary_prune_edge_rescue", disabled=not seg_tuning)
+            st.checkbox("Boundary prune skip low-leak latex", value=True, key="seg_boundary_prune_skip_low_leak", disabled=not seg_tuning)
 
             st.markdown("**Edge recovery (global)**")
             st.slider("Edge recover kd scale", min_value=0.0, max_value=2.5, value=1.0, step=0.05, key="seg_edge_kd", disabled=not seg_tuning)
@@ -271,11 +354,19 @@ def main() -> None:
             st.slider("Convexity min depth (frac)", min_value=0.010, max_value=0.080, value=0.030, step=0.002, key="seg_webbing_depth", disabled=not seg_tuning)
             st.slider("Convexity wedge dilate (px)", min_value=0, max_value=25, value=7, step=1, key="seg_webbing_wedge", disabled=not seg_tuning)
             st.slider("Convexity bg-overlap threshold", min_value=0.05, max_value=0.55, value=0.18, step=0.01, key="seg_webbing_overlap", disabled=not seg_tuning)
+            st.slider("Geometry fallback solidity", min_value=0.80, max_value=0.98, value=0.90, step=0.01, key="seg_gap_geom_solidity", disabled=not seg_tuning)
+            st.slider("Gap max remove frac", min_value=0.01, max_value=0.20, value=0.06, step=0.005, key="seg_gap_max_rm", disabled=not seg_tuning)
             st.markdown("**Edge-reachable carve (shadows + gaps)**")
             st.checkbox("Enable edge-reachable carve", value=True, key="seg_reach_carve_on", disabled=not seg_tuning)
             st.slider("Edge-reachable carve strength", min_value=0.0, max_value=2.5, value=1.0, step=0.05, key="seg_reach_carve_strength", disabled=not seg_tuning)
+            st.markdown("**Type-specific strategy**")
+            st.checkbox("Latex: multi-scale edge candidate", value=False, key="seg_latex_edge_ms", disabled=not seg_tuning)
+            st.checkbox("Leather: saturation candidate", value=False, key="seg_leather_sat", disabled=not seg_tuning)
+            st.checkbox("Fabric: variance candidate", value=False, key="seg_fabric_var", disabled=not seg_tuning)
 
         seg_cfg = _seg_cfg_from_sidebar(bool(seg_tuning))
+        if not seg_tuning:
+            seg_cfg = None
         st.subheader("Defect To Analyze")
         defect_options = ["All"] + list(DEFECT_LABELS)
         selected_defect = st.selectbox("Defect", options=defect_options, index=0)
@@ -357,6 +448,7 @@ def main() -> None:
                 bgr = _to_bgr_bytes(it["data"])
                 bgr = resize_max_side(bgr, max_side=1200)
                 res = pipeline.infer(bgr, focus_only=False, allowed_labels=allowed_labels, seg_cfg=seg_cfg)
+                seg_auto_dbg = dict(pipeline.last_seg_debug_info or {})
 
                 over = overlay_mask(bgr, res.glove_mask)
                 draw_list = [d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score))]
@@ -392,14 +484,59 @@ def main() -> None:
                     st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
                     st.image(cv2.cvtColor(over, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
                     if show_seg_debug:
-                        with st.expander("Segmentation debug", expanded=False):
+                        with st.expander("Segmentation debug", expanded=True):
                             bgr_p = preprocess(bgr)
-                            seg_res, seg_dbg = segment_glove_debug(bgr_p, cfg=seg_cfg)
+                            dbg_cfg = seg_cfg
+                            chosen_profile = str(seg_auto_dbg.get("chosen_profile", ""))
+                            if dbg_cfg is None and chosen_profile in {"latex", "leather", "fabric"}:
+                                dbg_cfg = pipeline.get_profile_seg_cfg(chosen_profile)
+                            seg_res, seg_dbg = segment_glove_debug(bgr_p, cfg=dbg_cfg)
+                            if seg_auto_dbg:
+                                st.markdown("**Auto profile selection**")
+                                mode = str(seg_auto_dbg.get("mode", ""))
+                                top_probe_label = str(seg_auto_dbg.get("top_probe_label", ""))
+                                top_probe_score = float(seg_auto_dbg.get("top_probe_score", 0.0))
+                                if mode == "auto_type_conditional":
+                                    st.caption(
+                                        f"profile={seg_auto_dbg.get('chosen_profile', 'balanced')} | "
+                                        f"top_probe={top_probe_label} ({top_probe_score:.2f})"
+                                    )
+                                elif mode == "manual_cfg":
+                                    st.caption("profile=manual sliders")
+                                trials = seg_auto_dbg.get("tried_profiles")
+                                if isinstance(trials, list) and trials:
+                                    st.dataframe(pd.DataFrame(trials), use_container_width=True, hide_index=True)
                             st.caption(
                                 f"chosen={seg_dbg.chosen_method} | bg_white={seg_dbg.bg_is_white} bg_uniform={seg_dbg.bg_is_uniform}"
                             )
+
+                            # ── Type strategy badge ─────────────────────
+                            _strategy_map = {
+                                "latex": "🧤 Edge-First (Latex)",
+                                "leather": "🧤 Chroma-Saturation (Leather)",
+                                "fabric": "🧤 Texture-Variance (Fabric)",
+                                "balanced": "🧤 Balanced (Auto)",
+                            }
+                            _profile = str(seg_auto_dbg.get("chosen_profile", "balanced"))
+                            _strat_label = _strategy_map.get(_profile, f"🧤 {_profile}")
+                            st.info(f"**Strategy**: {_strat_label}")
                             if seg_dbg.scored:
                                 st.dataframe(pd.DataFrame(seg_dbg.scored).head(6), use_container_width=True, hide_index=True)
+                            if seg_dbg.candidate_validity:
+                                rows_valid = [{"method": k, **v} for k, v in seg_dbg.candidate_validity.items()]
+                                st.markdown("**Candidate validity**")
+                                st.dataframe(pd.DataFrame(rows_valid), use_container_width=True, hide_index=True)
+                            st.markdown("**Refine diagnostics**")
+                            st.dataframe(
+                                pd.DataFrame(
+                                    [
+                                        {"kind": "carve", **seg_dbg.carve_stats},
+                                        {"kind": "prune", **seg_dbg.prune_stats},
+                                    ]
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
                             heat = cv2.applyColorMap(seg_dbg.d_bg_u8, cv2.COLORMAP_TURBO)
                             edges_rgb = cv2.cvtColor(seg_dbg.edges_u8, cv2.COLOR_GRAY2RGB)
@@ -424,6 +561,21 @@ def main() -> None:
                             st.markdown("**Final mask (this run)**")
                             final_over = overlay_mask(bgr, seg_res.glove_mask)
                             st.image(cv2.cvtColor(final_over, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
+
+                            # ── Shadow mask visualization ───────────────
+                            try:
+                                from gdd.core.segmentation import _compute_signals, _shadow_like_mask
+                                _sig = _compute_signals(bgr_p)
+                                _shadow = _shadow_like_mask(_sig, strictness=float(dbg_cfg.shadow_strictness) if dbg_cfg else 1.0)
+                                shadow_viz = bgr_p.copy()
+                                shadow_viz[_shadow > 0] = (
+                                    (shadow_viz[_shadow > 0].astype(np.float32) * 0.4
+                                     + np.array([200, 100, 50], dtype=np.float32) * 0.6)
+                                ).astype(np.uint8)
+                                st.markdown("**Shadow mask**")
+                                st.image(cv2.cvtColor(shadow_viz, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
+                            except Exception:
+                                pass  # graceful fallback if internal import fails
 
             st.markdown("### Comparison Table")
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -505,8 +657,13 @@ def main() -> None:
                 bgr = resize_max_side(bgr, max_side=1400)
                 bgr_p = preprocess(bgr)
 
-                seg_res, seg_dbg = segment_glove_debug(bgr_p, cfg=seg_cfg)
                 res = pipeline.infer(bgr, focus_only=False, allowed_labels=allowed_labels, seg_cfg=seg_cfg)
+                seg_auto_dbg = dict(pipeline.last_seg_debug_info or {})
+                dbg_cfg = seg_cfg
+                chosen_profile = str(seg_auto_dbg.get("chosen_profile", ""))
+                if dbg_cfg is None and chosen_profile in {"latex", "leather", "fabric"}:
+                    dbg_cfg = pipeline.get_profile_seg_cfg(chosen_profile)
+                seg_res, seg_dbg = segment_glove_debug(bgr_p, cfg=dbg_cfg)
 
                 cA, cB = st.columns(2)
                 with cA:
@@ -524,9 +681,39 @@ def main() -> None:
                     st.image(cv2.cvtColor(over, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
                     st.caption(f"seg_method={seg_dbg.chosen_method}")
 
+                if seg_auto_dbg:
+                    st.markdown("### Auto Profile Selection")
+                    mode = str(seg_auto_dbg.get("mode", ""))
+                    if mode == "auto_type_conditional":
+                        st.caption(
+                            f"profile={seg_auto_dbg.get('chosen_profile', 'balanced')} | "
+                            f"top_probe={seg_auto_dbg.get('top_probe_label', 'unknown')} "
+                            f"({float(seg_auto_dbg.get('top_probe_score', 0.0)):.2f})"
+                        )
+                    elif mode == "manual_cfg":
+                        st.caption("profile=manual sliders")
+                    trials = seg_auto_dbg.get("tried_profiles")
+                    if isinstance(trials, list) and trials:
+                        st.dataframe(pd.DataFrame(trials), use_container_width=True, hide_index=True)
+
                 st.markdown("### Segmentation Debug")
                 if seg_dbg.scored:
                     st.dataframe(pd.DataFrame(seg_dbg.scored).head(10), use_container_width=True, hide_index=True)
+                if seg_dbg.candidate_validity:
+                    rows_valid = [{"method": k, **v} for k, v in seg_dbg.candidate_validity.items()]
+                    st.markdown("**Candidate validity**")
+                    st.dataframe(pd.DataFrame(rows_valid), use_container_width=True, hide_index=True)
+                st.markdown("**Refine diagnostics**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {"kind": "carve", **seg_dbg.carve_stats},
+                            {"kind": "prune", **seg_dbg.prune_stats},
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     heat = cv2.applyColorMap(seg_dbg.d_bg_u8, cv2.COLORMAP_TURBO)

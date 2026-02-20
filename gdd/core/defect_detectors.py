@@ -174,7 +174,20 @@ def _count_fingers_convexity(mask01: np.ndarray) -> int:
     hull = cv2.convexHull(c, returnPoints=False)
     if hull is None or len(hull) < 3:
         return 0
-    defects = cv2.convexityDefects(c, hull)
+    try:
+        defects = cv2.convexityDefects(c, hull)
+    except cv2.error:
+        c2 = cv2.approxPolyDP(c, epsilon=2.0, closed=True)
+        if c2 is None or len(c2) < 4:
+            return 0
+        hull2 = cv2.convexHull(c2, returnPoints=False)
+        if hull2 is None or len(hull2) < 3:
+            return 0
+        try:
+            defects = cv2.convexityDefects(c2, hull2)
+            c = c2
+        except cv2.error:
+            return 0
     if defects is None:
         return 0
 

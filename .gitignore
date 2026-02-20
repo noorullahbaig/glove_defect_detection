@@ -1,15 +1,26 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.tox/
+.nox/
 .coverage
 htmlcov/
+.hypothesis/
+.cache/
+.python-version
 .venv/
 .venv_gdd/
 venv/
 env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
 
 # Data + artifacts (keep structure, not contents)
 data/raw/
