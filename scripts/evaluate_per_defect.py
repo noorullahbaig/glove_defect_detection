@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from gdd.core.defect_detectors import detect_defects
 from gdd.core.dataset import load_labels_csv, parse_defect_labels, validate_labels_df
 from gdd.core.image_io import read_image, resize_max_side
 from gdd.core.labels import DEFECT_LABELS
+from gdd.core.pipeline import GDDPipeline
 from gdd.core.preprocess import preprocess
 from gdd.core.segmentation import segment_glove
 from gdd.core.viz import draw_defects, overlay_mask
@@ -22,6 +24,7 @@ from gdd.core.viz import draw_defects, overlay_mask
 STRUCTURAL_LABELS = {
     "hole",
     "tear",
+    "wrinkles_dent",
     "missing_finger",
     "extra_fingers",
     "inside_out",
@@ -29,6 +32,15 @@ STRUCTURAL_LABELS = {
     "incomplete_beading",
     "damaged_by_fold",
 }
+
+
+def _glove_type_from_path(path: str) -> str:
+    p = Path(path)
+    parts = [str(x).strip().lower() for x in p.parts]
+    for gt in ("latex", "leather", "fabric"):
+        if gt in parts:
+            return gt
+    return "unknown"
 
 
 def _f1(p: float, r: float) -> float:
@@ -54,11 +66,17 @@ class DefectEvalSummary:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", default="data/ai_generated/labels.csv", help="Path to labels CSV")
+    ap.add_argument(
+        "--splits",
+        default="all",
+        help="Comma-separated splits to evaluate (e.g. test,val) or 'all' for all rows",
+    )
     ap.add_argument("--out-md", default="results/per_defect_report.md", help="Output Markdown report path")
     ap.add_argument("--out-csv", default="results/per_defect_metrics.csv", help="Output CSV summary path")
     ap.add_argument("--max-side", type=int, default=900, help="Resize max side before inference")
     ap.add_argument("--min-struct-score", type=float, default=0.65)
     ap.add_argument("--min-surface-score", type=float, default=0.85)
+    ap.add_argument("--thresholds-json", default="", help="Optional tuned thresholds JSON from scripts/tune_thresholds.py")
     ap.add_argument("--limit-failures", type=int, default=8, help="How many FP/FN examples to list per defect")
     ap.add_argument("--write-overlays", action="store_true", help="Write overlay images for top FP/FN cases under results/overlays/per_defect/")
     ap.add_argument("--max-overlays", type=int, default=4, help="Max FP and FN overlays per defect (each)")
@@ -69,29 +87,55 @@ def main() -> None:
     if errs:
         raise SystemExit("labels.csv validation failed:\n- " + "\n- ".join(errs))
 
-    test_df = df[df["split"].astype(str) == "test"].copy()
-    if test_df.empty:
-        raise SystemExit("No test rows in labels.csv (set split=test for some rows).")
+    split_arg = str(args.splits).strip().lower()
+    if split_arg == "all":
+        eval_df = df.copy()
+    else:
+        wanted_splits = {s.strip() for s in split_arg.split(",") if s.strip()}
+        eval_df = df[df["split"].astype(str).isin(wanted_splits)].copy()
+    if eval_df.empty:
+        raise SystemExit(f"No rows selected for splits='{args.splits}'.")
 
-    def passes_threshold(label: str, score: float) -> bool:
+    tuned_thresholds: dict = {}
+    if str(args.thresholds_json).strip():
+        p_thr = Path(str(args.thresholds_json))
+        if p_thr.exists():
+            try:
+                tuned_thresholds = json.loads(p_thr.read_text(encoding="utf-8"))
+            except Exception:
+                tuned_thresholds = {}
+
+    def passes_threshold(label: str, score: float, glove_type: str) -> bool:
+        gt = str(glove_type).strip().lower()
+        per_type = tuned_thresholds.get("per_type", {}) if isinstance(tuned_thresholds, dict) else {}
+        if isinstance(per_type, dict):
+            gt_map = per_type.get(gt, {})
+            if isinstance(gt_map, dict) and label in gt_map:
+                try:
+                    return float(score) >= float(gt_map[label])
+                except Exception:
+                    pass
         if label in STRUCTURAL_LABELS:
-            return score >= float(args.min_struct_score)
-        return score >= float(args.min_surface_score)
+            return float(score) >= float(args.min_struct_score)
+        return float(score) >= float(args.min_surface_score)
 
     # Applicability: cuff defects make sense only for latex in this project.
     def applicable_rows(label: str) -> pd.DataFrame:
         if label in {"improper_roll", "incomplete_beading"}:
-            return test_df[test_df["glove_type"].astype(str) == "latex"].copy()
-        return test_df
+            return eval_df[eval_df["glove_type"].astype(str) == "latex"].copy()
+        return eval_df
 
-    # Precompute preprocess + segmentation once per test image to make per-defect runs fast.
+    # Precompute preprocess + segmentation once per image to make per-defect runs fast.
+    pipeline = GDDPipeline.load_default()
     cache: dict[str, dict] = {}
-    for _, row in test_df.iterrows():
+    for _, row in eval_df.iterrows():
         path = str(row["file"])
+        glove_type = str(row.get("glove_type", "unknown")).strip().lower()
         img = read_image(path).bgr
         img = resize_max_side(img, max_side=int(args.max_side))
         bgr_p = preprocess(img)
-        seg = segment_glove(bgr_p)
+        seg_cfg = pipeline.get_profile_seg_cfg(glove_type)
+        seg = segment_glove(bgr_p, cfg=seg_cfg)
         cache[path] = {
             "bgr_p": bgr_p,
             "glove_mask": seg.glove_mask,
@@ -127,12 +171,13 @@ def main() -> None:
                 it["bgr_p"],
                 it["glove_mask"],
                 it["glove_mask_filled"],
+                glove_type=str(row.get("glove_type", "unknown")),
                 focus_only=False,
                 allowed_labels={lab},
             )
             lab_scores = [float(d.score) for d in defects if str(d.label) == lab]
             score = float(max(lab_scores)) if lab_scores else 0.0
-            pred_pos = bool(passes_threshold(lab, score))
+            pred_pos = bool(passes_threshold(lab, score, str(row.get("glove_type", "unknown"))))
 
             if is_pos:
                 scores_pos.append(score)
@@ -227,11 +272,13 @@ def main() -> None:
                         continue
                     img = resize_max_side(img, max_side=int(args.max_side))
                     bgr_p = preprocess(img)
-                    seg = segment_glove(bgr_p)
+                    gt_overlay = _glove_type_from_path(str(pth))
+                    seg = segment_glove(bgr_p, cfg=pipeline.get_profile_seg_cfg(gt_overlay))
                     defects, _anom = detect_defects(
                         bgr_p,
                         seg.glove_mask,
                         seg.glove_mask_filled,
+                        glove_type=gt_overlay,
                         focus_only=False,
                         allowed_labels={lab},
                     )
@@ -269,9 +316,12 @@ def main() -> None:
     lines.append("# Per-Defect Evaluation Report")
     lines.append("")
     lines.append(f"- Labels file: `{args.labels}`")
-    lines.append(f"- Test rows: `{len(test_df)}`")
+    lines.append(f"- Evaluated rows: `{len(eval_df)}`")
+    lines.append(f"- Splits used: `{args.splits}`")
     lines.append(f"- Scoring thresholds: structural >= `{args.min_struct_score}`, surface >= `{args.min_surface_score}`")
-    lines.append(f"- Note: `improper_roll` and `incomplete_beading` are evaluated on `latex` test rows only.")
+    if tuned_thresholds:
+        lines.append(f"- Tuned thresholds JSON: `{args.thresholds_json}`")
+    lines.append(f"- Note: `improper_roll` and `incomplete_beading` are evaluated on `latex` rows only.")
     lines.append("")
     lines.append("## Summary (sorted by weakest F1)")
     lines.append("")
@@ -318,8 +368,8 @@ def main() -> None:
 
     lines.append("## Recommendations (Data To Add / Prompt Fixes)")
     lines.append("")
-    lines.append("This dataset is small, so many defects have only 1–3 positive test samples. For stable metrics, target **at least 6 images per (glove_type, defect)**,")
-    lines.append("so that you reliably get 1–2 positives in the test split per category.")
+    lines.append("This dataset is small, so many defects have only 1–3 positive samples. For stable metrics, target **at least 6 images per (glove_type, defect)**,")
+    lines.append("so that each defect has enough positive coverage for robust threshold tuning and evaluation.")
     lines.append("")
     for s in sorted(summaries, key=lambda x: (x.f1, x.label)):
         lab = s.label

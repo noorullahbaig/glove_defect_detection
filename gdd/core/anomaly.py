@@ -54,9 +54,12 @@ def texture_anomaly_map(bgr: np.ndarray, mask01: np.ndarray) -> np.ndarray:
     return anom
 
 
-def edge_map(bgr: np.ndarray, mask01: np.ndarray) -> np.ndarray:
+def edge_map(bgr: np.ndarray, mask01: np.ndarray, blur_ksize: int = 5) -> np.ndarray:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    k = int(max(3, blur_ksize))
+    if (k % 2) == 0:
+        k += 1
+    gray = cv2.GaussianBlur(gray, (k, k), 0)
     edges = cv2.Canny(gray, 60, 160).astype(np.float32) / 255.0
     edges[mask01 == 0] = 0.0
     # Local edge density (texture/crease indicator)
@@ -65,17 +68,48 @@ def edge_map(bgr: np.ndarray, mask01: np.ndarray) -> np.ndarray:
     return _normalize01(density, mask01)
 
 
-def build_anomaly_maps(bgr: np.ndarray, glove_mask: np.ndarray) -> AnomalyMaps:
+def build_anomaly_maps(
+    bgr: np.ndarray,
+    glove_mask: np.ndarray,
+    *,
+    color_weight: float = 0.55,
+    texture_weight: float = 0.25,
+    edge_weight: float = 0.20,
+    edge_blur_ksize: int = 5,
+    suppress_mask01: np.ndarray | None = None,
+) -> AnomalyMaps:
     mask01 = (glove_mask > 0).astype(np.uint8)
     c = color_anomaly_map(bgr, mask01)
     t = texture_anomaly_map(bgr, mask01)
-    e = edge_map(bgr, mask01)
-    combined = np.clip(0.55 * c + 0.25 * t + 0.20 * e, 0.0, 1.0).astype(np.float32)
+    e = edge_map(bgr, mask01, blur_ksize=int(edge_blur_ksize))
+    cw = float(max(0.0, color_weight))
+    tw = float(max(0.0, texture_weight))
+    ew = float(max(0.0, edge_weight))
+    wsum = float(cw + tw + ew)
+    if wsum <= 1e-6:
+        cw, tw, ew, wsum = 0.55, 0.25, 0.20, 1.0
+    cw /= wsum
+    tw /= wsum
+    ew /= wsum
+    combined = np.clip((cw * c) + (tw * t) + (ew * e), 0.0, 1.0).astype(np.float32)
+    if suppress_mask01 is not None:
+        sm = (suppress_mask01 > 0)
+        c[sm] = 0.0
+        t[sm] = 0.0
+        e[sm] = 0.0
+        combined[sm] = 0.0
     combined[mask01 == 0] = 0.0
     return AnomalyMaps(color=c, texture=t, edges=e, combined=combined)
 
 
-def candidate_blobs(combined: np.ndarray, glove_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def candidate_blobs(
+    combined: np.ndarray,
+    glove_mask: np.ndarray,
+    *,
+    mode: str = "otsu",
+    percentile: float = 95.0,
+    offset: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Threshold the combined anomaly map within the glove region and return:
     - candidate_mask01
@@ -88,12 +122,15 @@ def candidate_blobs(combined: np.ndarray, glove_mask: np.ndarray) -> tuple[np.nd
         z = np.zeros(mask01.shape, np.uint8)
         return z, z, np.zeros((0, 5), np.int32)
 
-    # Otsu on scaled values within mask.
+    # Otsu/percentile thresholding on values within mask.
     scaled = (combined * 255).astype(np.uint8)
     inside = scaled[mask01 > 0]
-    th_val, _th_img = cv2.threshold(inside, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Make the threshold a bit more conservative to reduce background leakage.
-    th_val = min(255, int(th_val) + 10)
+    if str(mode).strip().lower() == "percentile":
+        p = float(np.clip(percentile, 70.0, 99.9))
+        th_val = int(np.clip(np.percentile(inside, p), 0, 255))
+    else:
+        th_val, _th_img = cv2.threshold(inside, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        th_val = min(255, int(th_val) + int(round(float(offset))))
     cand01 = ((scaled >= int(th_val)) & (mask01 > 0)).astype(np.uint8)
 
     cand01 = cv2.morphologyEx(cand01, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)

@@ -58,6 +58,7 @@ def main() -> None:
     structural_labels = {
         "hole",
         "tear",
+        "wrinkles_dent",
         "missing_finger",
         "extra_fingers",
         "inside_out",

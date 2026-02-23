@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import cv2
@@ -48,6 +49,18 @@ def _put_badge(bgr: np.ndarray, text: str, color: tuple[int, int, int] = (0, 0, 
 @st.cache_resource
 def _load_pipeline() -> GDDPipeline:
     return GDDPipeline.load_default()
+
+
+@st.cache_data(show_spinner=False)
+def _load_tuned_thresholds(path: str = "gdd/models/defect_thresholds.json") -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _apply_seg_preset(preset: str) -> None:
@@ -256,6 +269,8 @@ def main() -> None:
     st.caption("Classical CV pipeline (no Haar cascade, no TensorFlow, no template matching).")
 
     pipeline = _load_pipeline()
+    tuned_thresholds = _load_tuned_thresholds()
+    has_tuned_thresholds = bool(isinstance(tuned_thresholds.get("per_type"), dict) and tuned_thresholds.get("per_type"))
 
     with st.sidebar:
         st.subheader("Controls")
@@ -367,6 +382,11 @@ def main() -> None:
         seg_cfg = _seg_cfg_from_sidebar(bool(seg_tuning))
         if not seg_tuning:
             seg_cfg = None
+        force_defect_glove_type = st.selectbox("Force defect glove type", options=["Auto", "latex", "leather", "fabric"], index=0)
+        threshold_mode_options = ["Manual sliders"]
+        if has_tuned_thresholds:
+            threshold_mode_options.append("Tuned per type")
+        threshold_mode = st.selectbox("Threshold mode", options=threshold_mode_options, index=0)
         st.subheader("Defect To Analyze")
         defect_options = ["All"] + list(DEFECT_LABELS)
         selected_defect = st.selectbox("Defect", options=defect_options, index=0)
@@ -388,6 +408,7 @@ def main() -> None:
     structural_labels = {
         "hole",
         "tear",
+        "wrinkles_dent",
         "missing_finger",
         "extra_fingers",
         "inside_out",
@@ -396,12 +417,29 @@ def main() -> None:
         "damaged_by_fold",
     }
 
-    def passes_threshold(label: str, score: float) -> bool:
+    def _threshold_for(label: str, glove_type_value: str) -> float:
+        if threshold_mode != "Tuned per type":
+            if label in structural_labels:
+                return float(min_struct_score)
+            return float(min_surface_score)
+        per_type = tuned_thresholds.get("per_type", {}) if isinstance(tuned_thresholds, dict) else {}
+        gt = str(glove_type_value).strip().lower()
+        if isinstance(per_type, dict):
+            gt_map = per_type.get(gt, {})
+            if isinstance(gt_map, dict) and label in gt_map:
+                try:
+                    return float(gt_map[label])
+                except Exception:
+                    pass
         if label in structural_labels:
-            return score >= float(min_struct_score)
-        return score >= float(min_surface_score)
+            return float(min_struct_score)
+        return float(min_surface_score)
+
+    def passes_threshold(label: str, score: float, glove_type_value: str) -> bool:
+        return float(score) >= float(_threshold_for(label, glove_type_value))
 
     allowed_labels = None if selected_defect == "All" else {str(selected_defect)}
+    forced_glove_type = None if force_defect_glove_type == "Auto" else str(force_defect_glove_type)
 
     tab1, tab2, tab3 = st.tabs(["Compare Uploads", "Batch Folder", "Segmentation Tuner"])
 
@@ -447,11 +485,20 @@ def main() -> None:
                 name = it["name"]
                 bgr = _to_bgr_bytes(it["data"])
                 bgr = resize_max_side(bgr, max_side=1200)
-                res = pipeline.infer(bgr, focus_only=False, allowed_labels=allowed_labels, seg_cfg=seg_cfg)
+                res = pipeline.infer(
+                    bgr,
+                    focus_only=False,
+                    allowed_labels=allowed_labels,
+                    seg_cfg=seg_cfg,
+                    force_glove_type=forced_glove_type,
+                )
+                eval_glove_type = str(forced_glove_type or res.glove_type)
                 seg_auto_dbg = dict(pipeline.last_seg_debug_info or {})
 
                 over = overlay_mask(bgr, res.glove_mask)
-                draw_list = [d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score))]
+                draw_list = [
+                    d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score), eval_glove_type)
+                ]
                 draw_list.sort(key=lambda d: float(d.score), reverse=True)
                 draw_list = draw_list[: int(max_boxes)]
                 over = draw_defects(over, draw_list)
@@ -461,11 +508,11 @@ def main() -> None:
                 if selected_defect != "All":
                     scores = [float(d.score) for d in res.defects if str(d.label) == str(selected_defect)]
                     sel_score = float(max(scores)) if scores else 0.0
-                    sel_present = bool(passes_threshold(str(selected_defect), float(sel_score)))
+                    sel_present = bool(passes_threshold(str(selected_defect), float(sel_score), eval_glove_type))
                     badge = f"{selected_defect}: {sel_score:.2f} ({'present' if sel_present else 'absent'})"
                     over = _put_badge(over, badge, color=(0, 255, 0) if sel_present else (0, 0, 255))
 
-                pred_defects = [d for d in res.defects if passes_threshold(str(d.label), float(d.score))]
+                pred_defects = [d for d in res.defects if passes_threshold(str(d.label), float(d.score), eval_glove_type)]
                 rows.append(
                     {
                         "file": name,
@@ -611,9 +658,13 @@ def main() -> None:
                             focus_only=False,
                             allowed_labels=allowed_labels,
                             seg_cfg=seg_cfg,
+                            force_glove_type=forced_glove_type,
                         )
+                        eval_glove_type = str(forced_glove_type or res.glove_type)
                         over = overlay_mask(bgr, res.glove_mask)
-                        draw_list = [d for d in res.defects if d.bbox is not None and passes_threshold(d.label, float(d.score))]
+                        draw_list = [
+                            d for d in res.defects if d.bbox is not None and passes_threshold(d.label, float(d.score), eval_glove_type)
+                        ]
                         draw_list.sort(key=lambda d: float(d.score), reverse=True)
                         draw_list = draw_list[: int(max_boxes)]
                         over = draw_defects(over, draw_list)
@@ -633,7 +684,9 @@ def main() -> None:
                                 "pred_glove_type_score": res.glove_type_score,
                                 "selected_defect": (None if selected_defect == "All" else selected_defect),
                                 "selected_defect_score": sel_score,
-                                "pred_defects": "|".join([d.label for d in res.defects if passes_threshold(d.label, float(d.score))]),
+                                "pred_defects": "|".join(
+                                    [d.label for d in res.defects if passes_threshold(d.label, float(d.score), eval_glove_type)]
+                                ),
                             }
                         )
                         prog.progress(int(100 * (i + 1) / len(paths)))
@@ -657,7 +710,14 @@ def main() -> None:
                 bgr = resize_max_side(bgr, max_side=1400)
                 bgr_p = preprocess(bgr)
 
-                res = pipeline.infer(bgr, focus_only=False, allowed_labels=allowed_labels, seg_cfg=seg_cfg)
+                res = pipeline.infer(
+                    bgr,
+                    focus_only=False,
+                    allowed_labels=allowed_labels,
+                    seg_cfg=seg_cfg,
+                    force_glove_type=forced_glove_type,
+                )
+                eval_glove_type = str(forced_glove_type or res.glove_type)
                 seg_auto_dbg = dict(pipeline.last_seg_debug_info or {})
                 dbg_cfg = seg_cfg
                 chosen_profile = str(seg_auto_dbg.get("chosen_profile", ""))
@@ -674,7 +734,9 @@ def main() -> None:
                 with cB:
                     st.markdown("**Defects Overlay**")
                     over = overlay_mask(bgr, res.glove_mask)
-                    draw_list = [d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score))]
+                    draw_list = [
+                        d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score), eval_glove_type)
+                    ]
                     draw_list.sort(key=lambda d: float(d.score), reverse=True)
                     draw_list = draw_list[: int(max_boxes)]
                     over = draw_defects(over, draw_list)
