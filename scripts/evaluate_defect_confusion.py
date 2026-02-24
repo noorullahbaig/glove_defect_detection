@@ -15,6 +15,9 @@ from gdd.core.dataset import load_labels_csv, parse_defect_labels, validate_labe
 from gdd.core.image_io import read_image, resize_max_side
 from gdd.core.labels import DEFECT_LABELS
 from gdd.core.pipeline import GDDPipeline
+from gdd.core.preprocess import preprocess
+from gdd.core.segmentation import segment_glove
+from gdd.core.defect_detectors import detect_defects
 
 
 STRUCTURAL_LABELS = {
@@ -154,10 +157,20 @@ def main() -> None:
         glove_type_true = str(row.get("glove_type", "unknown"))
         img = read_image(path).bgr
         img = resize_max_side(img, max_side=int(args.max_side))
-        res = pipeline.infer(img, force_glove_type=glove_type_true)
+        bgr_p = preprocess(img)
+        seg_cfg = pipeline.get_profile_seg_cfg(glove_type_true)
+        seg = segment_glove(bgr_p, cfg=seg_cfg)
+        defects, _anom = detect_defects(
+            bgr_p,
+            seg.glove_mask,
+            seg.glove_mask_filled,
+            glove_type=str(glove_type_true).strip().lower(),
+            focus_only=False,
+            allowed_labels=None,
+        )
 
         score_map = {label: 0.0 for label in DEFECT_LABELS}
-        for d in res.defects:
+        for d in defects:
             lab = str(d.label)
             if lab not in score_map:
                 continue

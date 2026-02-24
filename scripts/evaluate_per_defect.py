@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import pandas as pd
 
 import sys
@@ -18,6 +19,7 @@ from gdd.core.labels import DEFECT_LABELS
 from gdd.core.pipeline import GDDPipeline
 from gdd.core.preprocess import preprocess
 from gdd.core.segmentation import segment_glove
+from gdd.core.types import BoundingBox
 from gdd.core.viz import draw_defects, overlay_mask
 
 
@@ -63,6 +65,41 @@ class DefectEvalSummary:
     avg_score_neg: float
 
 
+def _bbox_metrics(bbox: BoundingBox | None, glove_mask_filled: object) -> dict[str, float]:
+    if bbox is None:
+        return {"bbox_mask_frac": 0.0, "bbox_median_dt": 0.0, "bbox_interior_frac": 0.0}
+    try:
+        mf = (glove_mask_filled > 0).astype("uint8")
+    except Exception:
+        return {"bbox_mask_frac": 0.0, "bbox_median_dt": 0.0, "bbox_interior_frac": 0.0}
+    if mf.sum() <= 0:
+        return {"bbox_mask_frac": 0.0, "bbox_median_dt": 0.0, "bbox_interior_frac": 0.0}
+    h, w = mf.shape[:2]
+    x1, y1, x2, y2 = bbox.as_xyxy()
+    x1 = max(0, min(w - 1, int(x1)))
+    y1 = max(0, min(h - 1, int(y1)))
+    x2 = max(0, min(w, int(x2)))
+    y2 = max(0, min(h, int(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return {"bbox_mask_frac": 0.0, "bbox_median_dt": 0.0, "bbox_interior_frac": 0.0}
+
+    sub = mf[y1:y2, x1:x2]
+    sub_area = float(sub.size)
+    in_mask = (sub > 0)
+    mask_frac = float(in_mask.sum()) / float(sub_area + 1e-6)
+    if int(in_mask.sum()) <= 0:
+        return {"bbox_mask_frac": mask_frac, "bbox_median_dt": 0.0, "bbox_interior_frac": 0.0}
+
+    dt = cv2.distanceTransform((mf * 255).astype("uint8"), cv2.DIST_L2, 5)
+    vals = dt[y1:y2, x1:x2][in_mask]
+    if vals.size <= 0:
+        return {"bbox_mask_frac": mask_frac, "bbox_median_dt": 0.0, "bbox_interior_frac": 0.0}
+    median_dt = float(pd.Series(vals.ravel()).median())
+    # Interior threshold: >=4px into glove is typically away from segmentation jaggies at 900px max-side.
+    interior_frac = float((vals >= 4.0).sum()) / float(vals.size + 1e-6)
+    return {"bbox_mask_frac": float(mask_frac), "bbox_median_dt": float(median_dt), "bbox_interior_frac": float(interior_frac)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", default="data/ai_generated/labels.csv", help="Path to labels CSV")
@@ -71,8 +108,10 @@ def main() -> None:
         default="all",
         help="Comma-separated splits to evaluate (e.g. test,val) or 'all' for all rows",
     )
+    ap.add_argument("--out-dir", default="results", help="Base output folder for overlays + per-file outputs")
     ap.add_argument("--out-md", default="results/per_defect_report.md", help="Output Markdown report path")
     ap.add_argument("--out-csv", default="results/per_defect_metrics.csv", help="Output CSV summary path")
+    ap.add_argument("--out-csv-by-type", default="results/per_defect_metrics_by_type.csv", help="Output CSV summary path (per glove type)")
     ap.add_argument("--max-side", type=int, default=900, help="Resize max side before inference")
     ap.add_argument("--min-struct-score", type=float, default=0.65)
     ap.add_argument("--min-surface-score", type=float, default=0.85)
@@ -144,6 +183,7 @@ def main() -> None:
 
     per_file_rows: list[dict] = []
     summaries: list[DefectEvalSummary] = []
+    by_type_rows: list[dict] = []
     failure_examples: dict[str, dict[str, list[tuple[str, float]]]] = {}
 
     for lab in DEFECT_LABELS:
@@ -160,6 +200,7 @@ def main() -> None:
 
         for _, row in tdf.iterrows():
             path = str(row["file"])
+            glove_type_val = str(row.get("glove_type", "")).strip().lower()
             true_def = set(parse_defect_labels(str(row.get("defect_labels", ""))))
             is_pos = (lab in true_def)
 
@@ -175,9 +216,12 @@ def main() -> None:
                 focus_only=False,
                 allowed_labels={lab},
             )
-            lab_scores = [float(d.score) for d in defects if str(d.label) == lab]
-            score = float(max(lab_scores)) if lab_scores else 0.0
-            pred_pos = bool(passes_threshold(lab, score, str(row.get("glove_type", "unknown"))))
+            lab_defs = [d for d in defects if str(d.label) == lab]
+            best_def = max(lab_defs, key=lambda d: float(d.score)) if lab_defs else None
+            score = float(best_def.score) if best_def is not None else 0.0
+            pred_pos = bool(passes_threshold(lab, score, glove_type_val))
+            bbox = best_def.bbox if best_def is not None else None
+            bbox_meta = _bbox_metrics(bbox, it["glove_mask_filled"])
 
             if is_pos:
                 scores_pos.append(score)
@@ -199,10 +243,15 @@ def main() -> None:
                 {
                     "defect": lab,
                     "file": path,
-                    "glove_type": str(row.get("glove_type", "")),
+                    "glove_type": glove_type_val,
                     "true": bool(is_pos),
                     "score": score,
                     "pred": bool(pred_pos),
+                    "bbox_x": int(bbox.x) if bbox is not None else -1,
+                    "bbox_y": int(bbox.y) if bbox is not None else -1,
+                    "bbox_w": int(bbox.w) if bbox is not None else -1,
+                    "bbox_h": int(bbox.h) if bbox is not None else -1,
+                    **bbox_meta,
                 }
             )
 
@@ -238,7 +287,58 @@ def main() -> None:
             "fn": fns[: int(args.limit_failures)],
         }
 
-    out_dir = Path("results")
+        # Per-type metrics for this defect.
+        for gt in ("latex", "leather", "fabric"):
+            sub = tdf[tdf["glove_type"].astype(str).str.strip().str.lower() == gt].copy()
+            if sub.empty:
+                continue
+            ttp = tfp = tfn = ttn = 0
+            for _, row in sub.iterrows():
+                path = str(row["file"])
+                true_def = set(parse_defect_labels(str(row.get("defect_labels", ""))))
+                is_pos = (lab in true_def)
+                it = cache.get(path)
+                if it is None:
+                    continue
+                defects, _anom = detect_defects(
+                    it["bgr_p"],
+                    it["glove_mask"],
+                    it["glove_mask_filled"],
+                    glove_type=gt,
+                    focus_only=False,
+                    allowed_labels={lab},
+                )
+                lab_defs = [d for d in defects if str(d.label) == lab]
+                best_def = max(lab_defs, key=lambda d: float(d.score)) if lab_defs else None
+                score = float(best_def.score) if best_def is not None else 0.0
+                pred_pos = bool(passes_threshold(lab, score, gt))
+                if is_pos and pred_pos:
+                    ttp += 1
+                elif (not is_pos) and pred_pos:
+                    tfp += 1
+                elif is_pos and (not pred_pos):
+                    tfn += 1
+                else:
+                    ttn += 1
+            pp = ttp / (ttp + tfp + 1e-9)
+            rr = ttp / (ttp + tfn + 1e-9)
+            by_type_rows.append(
+                {
+                    "glove_type": gt,
+                    "label": lab,
+                    "n_pos": int(ttp + tfn),
+                    "n_neg": int(tfp + ttn),
+                    "tp": int(ttp),
+                    "fp": int(tfp),
+                    "fn": int(tfn),
+                    "tn": int(ttn),
+                    "precision": float(pp),
+                    "recall": float(rr),
+                    "f1": float(_f1(float(pp), float(rr))),
+                }
+            )
+
+    out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Write CSV summary.
@@ -251,6 +351,13 @@ def main() -> None:
     per_file = pd.DataFrame(per_file_rows)
     per_file_path = out_dir / "per_defect_per_file.csv"
     per_file.to_csv(per_file_path, index=False)
+
+    by_type_df = pd.DataFrame(by_type_rows)
+    out_csv_by_type = Path(args.out_csv_by_type)
+    out_csv_by_type.parent.mkdir(parents=True, exist_ok=True)
+    if not by_type_df.empty:
+        by_type_df = by_type_df.sort_values(["glove_type", "f1", "label"], ascending=[True, True, True])
+        by_type_df.to_csv(out_csv_by_type, index=False)
 
     if bool(args.write_overlays):
         ov_dir = out_dir / "overlays" / "per_defect"
@@ -322,6 +429,8 @@ def main() -> None:
     if tuned_thresholds:
         lines.append(f"- Tuned thresholds JSON: `{args.thresholds_json}`")
     lines.append(f"- Note: `improper_roll` and `incomplete_beading` are evaluated on `latex` rows only.")
+    if not by_type_df.empty:
+        lines.append(f"- Per-type metrics CSV: `{out_csv_by_type}`")
     lines.append("")
     lines.append("## Summary (sorted by weakest F1)")
     lines.append("")
@@ -396,6 +505,8 @@ def main() -> None:
     out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     print(f"Wrote: {out_csv}")
+    if not by_type_df.empty:
+        print(f"Wrote: {out_csv_by_type}")
     print(f"Wrote: {per_file_path}")
     print(f"Wrote: {out_md}")
     if bool(args.write_overlays):

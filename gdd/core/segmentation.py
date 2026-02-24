@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
 import cv2
 import numpy as np
 
@@ -149,6 +150,12 @@ class SegmentationConfig:
     # Edge-based finger separation: uses Canny edges to carve inter-finger
     # gaps and recover clipped fingertips.
     edge_finger_separation_enabled: bool = False
+
+    # Final morphological close (seals tiny boundary gaps). Keep small for leather
+    # to avoid painting over interior tear/hole voids.
+    final_close_enabled: bool = True
+    final_close_k: int = 5
+    final_close_iters: int = 1
 
 
 @dataclass(frozen=True)
@@ -3008,6 +3015,11 @@ def segment_glove(
     - glove_mask: raw mask (may contain holes)
     - glove_mask_filled: same mask with internal holes filled (useful for shape features)
     """
+    # Deterministic behavior: OpenCV uses a global RNG for some routines (notably k-means).
+    # Fixing the seed here makes segmentation reproducible across runs and evaluation passes.
+    # Allow overriding for controlled A/B evaluation.
+    seed = int(os.environ.get("GDD_CV_RNG_SEED", "1"))
+    cv2.setRNGSeed(int(seed))
     cfg = SegmentationConfig() if cfg is None else cfg
     runtime: dict[str, object] = {} if debug_out is None else debug_out
     runtime.clear()
@@ -3236,7 +3248,13 @@ def segment_glove(
         refined01 = _select_component_centered(refined01)
 
     # Seal small gaps so interior holes (true defects) remain enclosed and detectable.
-    refined01 = cv2.morphologyEx(refined01, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    if bool(getattr(cfg, "final_close_enabled", True)):
+        k = int(max(0, getattr(cfg, "final_close_k", 5)))
+        it = int(max(1, getattr(cfg, "final_close_iters", 1)))
+        if k > 0:
+            if (k % 2) == 0:
+                k += 1
+            refined01 = cv2.morphologyEx(refined01, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8), iterations=it)
     filled01 = _fill_holes(refined01)
 
     return SegmentationResult(
@@ -3250,6 +3268,8 @@ def segment_glove_debug(bgr: np.ndarray, cfg: SegmentationConfig | None = None) 
     """
     Debug version of segmentation: returns the segmentation result plus signals/candidates.
     """
+    seed = int(os.environ.get("GDD_CV_RNG_SEED", "1"))
+    cv2.setRNGSeed(int(seed))
     cfg = SegmentationConfig() if cfg is None else cfg
     sig = _compute_signals(bgr)
     candidates, silhouette_ref, scored_base, candidate_validity = _prepare_candidates(bgr, sig, cfg)
