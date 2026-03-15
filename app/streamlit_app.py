@@ -438,6 +438,17 @@ def main() -> None:
     def passes_threshold(label: str, score: float, glove_type_value: str) -> bool:
         return float(score) >= float(_threshold_for(label, glove_type_value))
 
+    def _defect_eval_glove_type(defect, fallback_glove_type: str) -> str:
+        if defect is None:
+            return str(fallback_glove_type)
+        label = str(getattr(defect, "label", "") or "")
+        meta = getattr(defect, "meta", None) or {}
+        if label == "improper_roll":
+            rescue_profile = str(meta.get("rescue_profile", "")).strip().lower()
+            if rescue_profile in {"latex", "fabric", "leather"}:
+                return rescue_profile
+        return str(fallback_glove_type)
+
     allowed_labels = None if selected_defect == "All" else {str(selected_defect)}
     forced_glove_type = None if force_defect_glove_type == "Auto" else str(force_defect_glove_type)
 
@@ -497,7 +508,10 @@ def main() -> None:
 
                 over = overlay_mask(bgr, res.glove_mask)
                 draw_list = [
-                    d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score), eval_glove_type)
+                    d
+                    for d in res.defects
+                    if d.bbox is not None
+                    and passes_threshold(str(d.label), float(d.score), _defect_eval_glove_type(d, eval_glove_type))
                 ]
                 draw_list.sort(key=lambda d: float(d.score), reverse=True)
                 draw_list = draw_list[: int(max_boxes)]
@@ -506,13 +520,19 @@ def main() -> None:
                 sel_score = None
                 sel_present = None
                 if selected_defect != "All":
-                    scores = [float(d.score) for d in res.defects if str(d.label) == str(selected_defect)]
-                    sel_score = float(max(scores)) if scores else 0.0
-                    sel_present = bool(passes_threshold(str(selected_defect), float(sel_score), eval_glove_type))
+                    sel_defects = [d for d in res.defects if str(d.label) == str(selected_defect)]
+                    sel_best = max(sel_defects, key=lambda d: float(d.score)) if sel_defects else None
+                    sel_score = float(sel_best.score) if sel_best is not None else 0.0
+                    sel_eval_glove_type = _defect_eval_glove_type(sel_best, eval_glove_type)
+                    sel_present = bool(passes_threshold(str(selected_defect), float(sel_score), sel_eval_glove_type))
                     badge = f"{selected_defect}: {sel_score:.2f} ({'present' if sel_present else 'absent'})"
                     over = _put_badge(over, badge, color=(0, 255, 0) if sel_present else (0, 0, 255))
 
-                pred_defects = [d for d in res.defects if passes_threshold(str(d.label), float(d.score), eval_glove_type)]
+                pred_defects = [
+                    d
+                    for d in res.defects
+                    if passes_threshold(str(d.label), float(d.score), _defect_eval_glove_type(d, eval_glove_type))
+                ]
                 rows.append(
                     {
                         "file": name,
@@ -663,7 +683,10 @@ def main() -> None:
                         eval_glove_type = str(forced_glove_type or res.glove_type)
                         over = overlay_mask(bgr, res.glove_mask)
                         draw_list = [
-                            d for d in res.defects if d.bbox is not None and passes_threshold(d.label, float(d.score), eval_glove_type)
+                            d
+                            for d in res.defects
+                            if d.bbox is not None
+                            and passes_threshold(d.label, float(d.score), _defect_eval_glove_type(d, eval_glove_type))
                         ]
                         draw_list.sort(key=lambda d: float(d.score), reverse=True)
                         draw_list = draw_list[: int(max_boxes)]
@@ -685,7 +708,11 @@ def main() -> None:
                                 "selected_defect": (None if selected_defect == "All" else selected_defect),
                                 "selected_defect_score": sel_score,
                                 "pred_defects": "|".join(
-                                    [d.label for d in res.defects if passes_threshold(d.label, float(d.score), eval_glove_type)]
+                                    [
+                                        d.label
+                                        for d in res.defects
+                                        if passes_threshold(d.label, float(d.score), _defect_eval_glove_type(d, eval_glove_type))
+                                    ]
                                 ),
                             }
                         )
@@ -735,7 +762,10 @@ def main() -> None:
                     st.markdown("**Defects Overlay**")
                     over = overlay_mask(bgr, res.glove_mask)
                     draw_list = [
-                        d for d in res.defects if d.bbox is not None and passes_threshold(str(d.label), float(d.score), eval_glove_type)
+                        d
+                        for d in res.defects
+                        if d.bbox is not None
+                        and passes_threshold(str(d.label), float(d.score), _defect_eval_glove_type(d, eval_glove_type))
                     ]
                     draw_list.sort(key=lambda d: float(d.score), reverse=True)
                     draw_list = draw_list[: int(max_boxes)]

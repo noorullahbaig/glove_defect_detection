@@ -831,6 +831,47 @@ def _detect_holes(
             if not (mean_dt >= 14.0 or area_norm >= 0.0007):
                 continue
 
+        macro_hole_ok = bool(
+            glove_type_norm == "latex"
+            and area_norm >= 0.0030
+            and area_norm <= 0.120
+            and float(aspect) <= 2.4
+            and float(circ) >= 0.68
+            and mean_dt >= 20.0
+            and d_bg <= 12.0
+            and d_glove >= 22.0
+            and (de_ring >= 18.0 or ring_d_bg >= 22.0)
+        )
+        if macro_hole_ok:
+            score = _clamp01(
+                0.72
+                + 0.10 * min(1.0, max(0.0, (float(circ) - 0.68) / 0.22))
+                + 0.10 * min(1.0, mean_dt / 120.0)
+                + 0.08 * min(1.0, area_norm / 0.060)
+                + 0.06 * min(1.0, max(0.0, d_glove - d_bg) / 60.0)
+            )
+            out.append(
+                Defect(
+                    label="hole",
+                    score=score,
+                    bbox=bbox,
+                    meta={
+                        "area": area,
+                        "aspect": float(aspect),
+                        "circularity": float(circ),
+                        "area_norm": area_norm,
+                        "d_bg": d_bg,
+                        "d_glove": d_glove,
+                        "mean_dt": mean_dt,
+                        "de_ring": de_ring,
+                        "ring_d_bg": ring_d_bg,
+                        "ring_l_abs": ring_l_abs,
+                        "source": "latex_macro_hole",
+                    },
+                )
+            )
+            continue
+
         # Confidence heuristic: bigger voids + high circularity are strong evidence.
         size_norm = 0.008
         hole_area_max = 0.0060

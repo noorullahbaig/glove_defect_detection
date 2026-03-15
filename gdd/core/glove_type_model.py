@@ -73,7 +73,6 @@ def train_glove_type_model(x: np.ndarray, y: list[str], model_type: str = "logre
                     "clf",
                     LogisticRegression(
                         max_iter=2500,
-                        n_jobs=-1,
                         class_weight="balanced",
                         solver="lbfgs",
                     ),
