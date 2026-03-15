@@ -112,7 +112,7 @@ def main() -> None:
     ap.add_argument("--out-md", default="results/per_defect_report.md", help="Output Markdown report path")
     ap.add_argument("--out-csv", default="results/per_defect_metrics.csv", help="Output CSV summary path")
     ap.add_argument("--out-csv-by-type", default="results/per_defect_metrics_by_type.csv", help="Output CSV summary path (per glove type)")
-    ap.add_argument("--max-side", type=int, default=900, help="Resize max side before inference")
+    ap.add_argument("--max-side", type=int, default=1100, help="Resize max side before inference")
     ap.add_argument("--min-struct-score", type=float, default=0.65)
     ap.add_argument("--min-surface-score", type=float, default=0.85)
     ap.add_argument("--thresholds-json", default="", help="Optional tuned thresholds JSON from scripts/tune_thresholds.py")
@@ -158,10 +158,7 @@ def main() -> None:
             return float(score) >= float(args.min_struct_score)
         return float(score) >= float(args.min_surface_score)
 
-    # Applicability: cuff defects make sense only for latex in this project.
     def applicable_rows(label: str) -> pd.DataFrame:
-        if label in {"improper_roll", "incomplete_beading"}:
-            return eval_df[eval_df["glove_type"].astype(str) == "latex"].copy()
         return eval_df
 
     # Precompute preprocess + segmentation once per image to make per-defect runs fast.
@@ -428,7 +425,7 @@ def main() -> None:
     lines.append(f"- Scoring thresholds: structural >= `{args.min_struct_score}`, surface >= `{args.min_surface_score}`")
     if tuned_thresholds:
         lines.append(f"- Tuned thresholds JSON: `{args.thresholds_json}`")
-    lines.append(f"- Note: `improper_roll` and `incomplete_beading` are evaluated on `latex` rows only.")
+    lines.append("- Note: `improper_roll` and `incomplete_beading` are evaluated across all glove types present in the labels file.")
     if not by_type_df.empty:
         lines.append(f"- Per-type metrics CSV: `{out_csv_by_type}`")
     lines.append("")
@@ -494,7 +491,7 @@ def main() -> None:
         if lab in {"stain_dirty", "spotting", "plastic_contamination"}:
             recs.append("Add more `normal` images too (per glove type). These defects are prone to false positives on AI textures; more clean negatives help tuning and evaluation.")
         if lab in {"improper_roll", "incomplete_beading"}:
-            recs.append("Latex-only: generate only on latex gloves, with the cuff region large in frame (glove opening visible).")
+            recs.append("Keep the cuff region large in frame for every glove type so the glove opening is clearly visible during tuning and evaluation.")
 
         if recs:
             lines.append(f"### `{lab}`")

@@ -95,8 +95,8 @@ Structural labels include:
 - `missing_finger`
 - `extra_fingers`
 - `inside_out`
-- `improper_roll`
-- `incomplete_beading`
+- `improper_roll` (cuff defect; supported on latex, leather, and fabric)
+- `incomplete_beading` (cuff defect; supported on latex, leather, and fabric)
 - `damaged_by_fold`
 
 Surface labels include:

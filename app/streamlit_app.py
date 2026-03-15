@@ -401,7 +401,7 @@ def main() -> None:
 | plastic_contamination | Yes | Yes | Yes |
 | wrinkles_dent, damaged_by_fold, inside_out | Yes | Yes | Yes |
 | missing_finger, extra_fingers | Yes | Yes (rare) | Yes (rare) |
-| improper_roll, incomplete_beading | Yes | No | No |
+| improper_roll, incomplete_beading | Yes | Yes | Yes |
                 """.strip()
             )
 

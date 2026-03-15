@@ -199,6 +199,38 @@ class GDDPipeline:
         }
         return float(score), metrics
 
+    @staticmethod
+    def _material_cue_scores(bgr: np.ndarray, mask_u8: np.ndarray) -> dict[str, float]:
+        mask01 = (mask_u8 > 0).astype(np.uint8)
+        if int(mask01.sum()) < 400:
+            return {"fabric": 0.0, "leather": 0.0, "interior_edge_density": 0.0, "laplace_std": 0.0, "sat_mean": 0.0}
+
+        interior = cv2.erode(mask01, np.ones((9, 9), np.uint8), iterations=1)
+        if int(interior.sum()) < 200:
+            interior = mask01
+
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 60, 160)
+        edge_density = float(((edges > 0) & (interior > 0)).sum()) / float(interior.sum() + 1e-6)
+
+        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        lap_vals = np.abs(lap[interior > 0]).astype(np.float32)
+        lap_std = float(lap_vals.std()) if lap_vals.size else 0.0
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        sat_vals = hsv[:, :, 1][interior > 0].astype(np.float32)
+        sat_mean = float(sat_vals.mean()) if sat_vals.size else 0.0
+
+        fabric_score = 0.60 * min(1.0, edge_density / 0.12) + 0.40 * min(1.0, lap_std / 42.0)
+        leather_score = 0.55 * min(1.0, max(0.0, 0.12 - edge_density) / 0.12) + 0.45 * min(1.0, sat_mean / 48.0)
+        return {
+            "fabric": float(fabric_score),
+            "leather": float(leather_score),
+            "interior_edge_density": float(edge_density),
+            "laplace_std": float(lap_std),
+            "sat_mean": float(sat_mean),
+        }
+
     def get_profile_seg_cfg(self, glove_type: str) -> SegmentationConfig:
         return _profile_seg_cfg(glove_type)
 
@@ -215,6 +247,34 @@ class GDDPipeline:
             if gt in probs:
                 out[gt] = float(probs[gt])
         return out
+
+    def _resolve_glove_type(
+        self,
+        trial_probs: dict[str, float],
+        cue_scores: dict[str, float],
+        chosen_profile: str,
+    ) -> tuple[str, float, dict[str, float]]:
+        blended: dict[str, float] = {gt: float(trial_probs.get(gt, 0.0)) for gt in KNOWN_GLOVE_TYPES}
+        profile = str(chosen_profile).strip().lower()
+        if profile in blended:
+            blended[profile] += 0.18
+
+        blended["fabric"] += 0.42 * float(cue_scores.get("fabric", 0.0))
+        blended["fabric"] -= 0.10 * float(cue_scores.get("leather", 0.0))
+        blended["leather"] += 0.18 * float(cue_scores.get("leather", 0.0))
+        blended["leather"] -= 0.20 * float(cue_scores.get("fabric", 0.0))
+
+        if profile == "fabric" and float(cue_scores.get("fabric", 0.0)) >= 0.75:
+            blended["fabric"] += 0.18
+        if profile == "leather" and float(cue_scores.get("leather", 0.0)) >= 0.65:
+            blended["leather"] += 0.10
+
+        best_label = max(KNOWN_GLOVE_TYPES, key=lambda gt: float(blended.get(gt, 0.0)))
+        total = float(sum(max(0.0, float(v)) for v in blended.values()))
+        if total <= 1e-6:
+            return "unknown", 0.0, blended
+        score = float(max(0.0, blended.get(best_label, 0.0)) / total)
+        return str(best_label), score, blended
 
     def _auto_segment(self, bgr_p: np.ndarray) -> tuple[SegmentationResult, dict[str, Any]]:
         debug: dict[str, Any] = {
@@ -241,6 +301,11 @@ class GDDPipeline:
             top_label, top_prob = str(ranked[0][0]), float(ranked[0][1])
             if top_prob >= float(DEFAULT_SEG_CONFIDENCE_THR):
                 try_profiles = [top_label]
+                # Fabric cuffs and knit textures can be over-confidently pulled toward
+                # leather on the probe mask. Always compare against fabric before
+                # finalizing a leather-led path.
+                if top_label == "leather" and "fabric" not in try_profiles:
+                    try_profiles.append("fabric")
             else:
                 try_profiles = [gt for gt, _p in ranked[: int(DEFAULT_SEG_TOPK)]]
                 if len(try_profiles) < 2:
@@ -255,17 +320,25 @@ class GDDPipeline:
             seg = segment_glove(bgr_p, cfg=cfg)
             q, metrics = self._mask_quality_score(bgr_p, seg.glove_mask)
             trial_probs = self._predict_glove_type_probs(bgr_p, seg.glove_mask, seg.glove_mask_filled)
+            cue_scores = self._material_cue_scores(bgr_p, seg.glove_mask)
             self_prob = float(trial_probs.get(str(profile), 0.0))
-            # Tie-break with class-consistency when probe confidence is not decisive.
-            q += 0.10 * float(self_prob)
+            # Blend segmentation quality with classifier confidence and material cues.
+            q += 0.04 * float(self_prob)
             if str(profile) == str(top_label):
                 q += 0.04
+            if str(profile) == "fabric":
+                q += 0.16 * float(cue_scores.get("fabric", 0.0))
+                q -= 0.05 * float(cue_scores.get("leather", 0.0))
+            elif str(profile) == "leather":
+                q += 0.10 * float(cue_scores.get("leather", 0.0))
+                q -= 0.08 * float(cue_scores.get("fabric", 0.0))
             row = {
                 "profile": str(profile),
                 "quality": float(q),
                 "seg_method": str(seg.method),
                 "trial_self_prob": float(self_prob),
                 "trial_type_probs": {k: float(v) for k, v in sorted(trial_probs.items(), key=lambda kv: float(kv[1]), reverse=True)},
+                "material_cues": {k: float(v) for k, v in cue_scores.items()},
                 **metrics,
             }
             trials.append(row)
@@ -313,8 +386,16 @@ class GDDPipeline:
         if self.glove_type_model is not None:
             feats = glove_type_features(bgr_p, seg.glove_mask, seg.glove_mask_filled)
             try:
-                glove_type, glove_type_score = self.glove_type_model.predict(feats)
+                trial_probs = self.glove_type_model.predict_proba(feats)
+                cue_scores = self._material_cue_scores(bgr_p, seg.glove_mask)
+                chosen_profile = "balanced"
                 if self.last_seg_debug_info is not None:
+                    chosen_profile = str(self.last_seg_debug_info.get("chosen_profile", "balanced"))
+                glove_type, glove_type_score, blended_scores = self._resolve_glove_type(trial_probs, cue_scores, chosen_profile)
+                if self.last_seg_debug_info is not None:
+                    self.last_seg_debug_info["final_type_probs"] = {k: float(v) for k, v in sorted(trial_probs.items(), key=lambda kv: float(kv[1]), reverse=True)}
+                    self.last_seg_debug_info["final_material_cues"] = {k: float(v) for k, v in cue_scores.items()}
+                    self.last_seg_debug_info["final_blended_type_scores"] = {k: float(v) for k, v in sorted(blended_scores.items(), key=lambda kv: float(kv[1]), reverse=True)}
                     self.last_seg_debug_info["final_glove_type"] = str(glove_type)
                     self.last_seg_debug_info["final_glove_type_score"] = float(glove_type_score)
             except Exception:

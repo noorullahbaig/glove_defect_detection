@@ -113,7 +113,7 @@ def main() -> None:
     )
     ap.add_argument("--out-json", default="gdd/models/defect_thresholds.json", help="Output JSON path")
     ap.add_argument("--out-csv", default="results/tuned_thresholds_metrics.csv", help="Output CSV summary path")
-    ap.add_argument("--max-side", type=int, default=900, help="Resize max side before inference")
+    ap.add_argument("--max-side", type=int, default=1100, help="Resize max side before inference")
     args = ap.parse_args()
 
     df = load_labels_csv(args.labels)
