@@ -266,7 +266,6 @@ def _seg_cfg_from_sidebar(enabled: bool) -> SegmentationConfig | None:
 
 def main() -> None:
     st.title("Glove Defect Detection (GDD)")
-    st.caption("Classical CV pipeline (no Haar cascade, no TensorFlow, no template matching).")
 
     pipeline = _load_pipeline()
     tuned_thresholds = _load_tuned_thresholds()
