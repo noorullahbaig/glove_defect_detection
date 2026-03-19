@@ -109,12 +109,16 @@ class AllModeConsistencyTests(unittest.TestCase):
                     self.assertEqual(res.glove_type, "unknown")
                     self.assertEqual({d.label for d in res.defects}, {"improper_roll", "incomplete_beading"})
 
-    def test_load_default_reports_missing_glove_type_model_path(self) -> None:
+    def test_load_default_tracks_glove_type_model_path_and_status(self) -> None:
         pipeline = GDDPipeline.load_default()
-        self.assertIsNone(pipeline.glove_type_model)
         self.assertEqual(pipeline.glove_type_model_path.name, "glove_type.joblib")
-        self.assertIsNotNone(pipeline.glove_type_model_error)
-        self.assertIn("glove_type.joblib", str(pipeline.glove_type_model_error))
+        if pipeline.glove_type_model_path.exists():
+            self.assertIsNotNone(pipeline.glove_type_model)
+            self.assertIsNone(pipeline.glove_type_model_error)
+        else:
+            self.assertIsNone(pipeline.glove_type_model)
+            self.assertIsNotNone(pipeline.glove_type_model_error)
+            self.assertIn("glove_type.joblib", str(pipeline.glove_type_model_error))
 
 
 if __name__ == "__main__":
