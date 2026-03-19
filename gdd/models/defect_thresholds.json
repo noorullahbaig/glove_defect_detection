@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "source_labels": "data/ai_generated/labels.csv",
+  "split_used": "adaptive_all",
+  "per_type": {
+    "latex": {
+      "discoloration": 0.83,
+      "spotting": 0.9,
+      "stain_dirty": 0.81,
+      "plastic_contamination": 0.89,
+      "tear": 0.88,
+      "hole": 0.69,
+      "wrinkles_dent": 0.65,
+      "damaged_by_fold": 0.73,
+      "inside_out": 0.65,
+      "improper_roll": 0.71,
+      "incomplete_beading": 0.61,
+      "missing_finger": 0.7799999999999999,
+      "extra_fingers": 0.7799999999999999
+    },
+    "leather": {
+      "discoloration": 0.9,
+      "spotting": 0.9,
+      "stain_dirty": 0.9,
+      "plastic_contamination": 0.9,
+      "tear": 0.88,
+      "hole": 0.88,
+      "wrinkles_dent": 0.68,
+      "damaged_by_fold": 0.7,
+      "inside_out": 0.67,
+      "improper_roll": 0.77,
+      "incomplete_beading": 0.88,
+      "missing_finger": 0.7799999999999999,
+      "extra_fingers": 0.7799999999999999
+    },
+    "fabric": {
+      "discoloration": 0.79,
+      "spotting": 0.89,
+      "stain_dirty": 0.9,
+      "plastic_contamination": 0.9,
+      "tear": 0.85,
+      "hole": 0.69,
+      "wrinkles_dent": 0.63,
+      "damaged_by_fold": 0.73,
+      "inside_out": 0.65,
+      "improper_roll": 0.7,
+      "incomplete_beading": 0.88,
+      "missing_finger": 0.7799999999999999,
+      "extra_fingers": 0.7799999999999999
+    }
+  }
+}
