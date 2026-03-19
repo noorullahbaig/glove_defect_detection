@@ -271,6 +271,15 @@ def main() -> None:
     tuned_thresholds = _load_tuned_thresholds()
     has_tuned_thresholds = bool(isinstance(tuned_thresholds.get("per_type"), dict) and tuned_thresholds.get("per_type"))
 
+    if pipeline.glove_type_model is None:
+        warn = (
+            "Glove-type classifier is unavailable. Predictions will show `unknown` until the trained model "
+            f"is available at `{pipeline.glove_type_model_path}`."
+        )
+        if pipeline.glove_type_model_error:
+            warn += f" Load status: {pipeline.glove_type_model_error}"
+        st.warning(warn)
+
     with st.sidebar:
         st.subheader("Controls")
         min_struct_score = st.slider("Min score (structural)", min_value=0.0, max_value=1.0, value=0.65, step=0.01)

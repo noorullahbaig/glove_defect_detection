@@ -14,7 +14,7 @@ from .segmentation import SegmentationConfig, SegmentationResult, segment_glove
 from .types import Defect, InferenceResult
 
 
-DEFAULT_GLOVE_TYPE_MODEL_PATH = Path("gdd/models/glove_type.joblib")
+DEFAULT_GLOVE_TYPE_MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "glove_type.joblib"
 DEFAULT_SEG_TOPK = 2
 DEFAULT_SEG_CONFIDENCE_THR = 0.75
 KNOWN_GLOVE_TYPES = ("latex", "leather", "fabric")
@@ -137,20 +137,35 @@ def _profile_seg_cfg(glove_type: str) -> SegmentationConfig:
 
 
 class GDDPipeline:
-    def __init__(self, glove_type_model: GloveTypeModel | None = None):
+    def __init__(
+        self,
+        glove_type_model: GloveTypeModel | None = None,
+        glove_type_model_path: Path | None = None,
+        glove_type_model_error: str | None = None,
+    ):
         self.glove_type_model = glove_type_model
+        self.glove_type_model_path = Path(glove_type_model_path or DEFAULT_GLOVE_TYPE_MODEL_PATH)
+        self.glove_type_model_error = glove_type_model_error
         self.last_seg_debug_info: dict[str, Any] | None = None
 
     @classmethod
     def load_default(cls) -> "GDDPipeline":
         model = None
+        model_error = None
         if DEFAULT_GLOVE_TYPE_MODEL_PATH.exists():
             try:
                 model = load_glove_type_model(DEFAULT_GLOVE_TYPE_MODEL_PATH)
-            except Exception:
+            except Exception as exc:
                 # Model may be stale (wrong classes or wrong feature length). Treat as missing.
                 model = None
-        return cls(glove_type_model=model)
+                model_error = str(exc)
+        else:
+            model_error = f"Missing glove-type model at {DEFAULT_GLOVE_TYPE_MODEL_PATH}"
+        return cls(
+            glove_type_model=model,
+            glove_type_model_path=DEFAULT_GLOVE_TYPE_MODEL_PATH,
+            glove_type_model_error=model_error,
+        )
 
     @staticmethod
     def _mask_quality_score(bgr: np.ndarray, mask_u8: np.ndarray) -> tuple[float, dict[str, float]]:
@@ -322,10 +337,13 @@ class GDDPipeline:
         debug: dict[str, Any] = {
             "mode": "auto_type_conditional",
             "model_available": bool(self.glove_type_model is not None),
+            "model_path": str(self.glove_type_model_path),
         }
         if self.glove_type_model is None:
             seg = segment_glove(bgr_p, cfg=None)
             debug["reason"] = "model_missing"
+            if self.glove_type_model_error:
+                debug["model_error"] = str(self.glove_type_model_error)
             debug["tried_profiles"] = [{"profile": "balanced", "quality": None, "seg_method": str(seg.method)}]
             debug["chosen_profile"] = "balanced"
             return seg, debug
@@ -426,6 +444,10 @@ class GDDPipeline:
                     self.last_seg_debug_info["final_glove_type_score"] = float(glove_type_score)
             except Exception:
                 glove_type, glove_type_score = "unknown", 0.0
+        elif self.last_seg_debug_info is not None:
+            self.last_seg_debug_info["final_glove_type"] = "unknown"
+            self.last_seg_debug_info["final_glove_type_score"] = 0.0
+            self.last_seg_debug_info["final_glove_type_reason"] = "model_missing"
 
         detect_glove_type = str(glove_type)
         if force_glove_type is not None and str(force_glove_type).strip():
