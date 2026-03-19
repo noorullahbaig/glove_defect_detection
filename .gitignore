@@ -32,6 +32,8 @@ results/
 gdd/models/*
 !gdd/models/
 !gdd/models/glove_type.joblib
+!gdd/models/glove_type_logreg.joblib
+!gdd/models/defect_thresholds.json
 
 # Streamlit
 .streamlit/secrets.toml
