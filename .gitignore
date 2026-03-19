@@ -29,7 +29,9 @@ data/ai_generated/images/
 data/processed/
 data/tmp/
 results/
-gdd/models/
+gdd/models/*
+!gdd/models/
+!gdd/models/glove_type.joblib
 
 # Streamlit
 .streamlit/secrets.toml
