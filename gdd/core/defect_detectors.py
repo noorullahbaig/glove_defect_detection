@@ -4311,8 +4311,7 @@ def detect_defects(
             defects.extend(_stain_from_discoloration(glove_type_norm, discol))
             defects.extend(discol)
         defects.extend(_edge_fold_wrinkle(ctx))
-        if glove_type_norm == "latex":
-            defects.extend(_roll_and_beading(ctx))
+        defects.extend(_roll_and_beading(ctx))
         if allow_fingers:
             defects.extend(_finger_count_anomaly(ctx))
         defects.extend(_inside_out(ctx))
